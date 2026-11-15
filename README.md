@@ -36,7 +36,7 @@ dossier `opencode/` (entrée `lifeos_ref`, défaut `main`).
 
 | Secret | Contenu | Portée |
 |---|---|---|
-| `GALASS_TOKEN` | jeton fine-grained, **seulement** `Galass_Driver`, `Galass_Rider`, `Galass_backend`, `galass-emu-actions-pub` (et `galass-ci` si besoin) | Contents, Pull requests, Workflows : read & write |
+| `GALASS_TOKEN` | jeton fine-grained, **seulement** `Galass_Driver`, `Galass_Rider`, `Galass_backend`, `galass-emu-actions-pub` (et `galass-ci` si besoin) | Contents, Pull requests, Workflows : read & write. Pour `with_emulators` : aussi **Actions : read & write** sur `galass-emu-actions-pub` (déclencher et lire `artemis-staging-e2e.yml`) |
 | `LIFEOS_READ_TOKEN` | même valeur que sur `antenly-ci` : jeton fine-grained, **seulement** `LordThiouk/lifeos` | Contents: read |
 | `ISA_STAMP_KEY` | même valeur que sur `antenly-ci` : contenu de `~/.claude/LIFEOS/MEMORY/STATE/.isa-stamp-key` de la box (64 hex) | — |
 | `OC_NOTIFY_URL` | URL du webhook opencode-notify (la même que `OC_NOTIFY_URL` de `~/.oc-run/config` sur la box) | optionnel |
@@ -74,7 +74,7 @@ Onglet Actions → `opencode FullRun` → `Run workflow` :
 | `isa_path` | `MEMORY/WORK/<dossier>/ISA.md`, ou vide (déduite du prompt). |
 | `base_branch` | Cible de la PR en brouillon (vide = branche par défaut du dépôt concerné). |
 | `idle_minutes` / `wip_push_minutes` | Silence max et rythme de push des wip (dépôt cible). |
-| `with_emulators` | Défaut `false`. Si `true`, le job complète au besoin `extra_repos` avec `Galass_Rider`, `Galass_Driver` et `galass-emu-actions-pub` (sauf le `target_repo`), compile et installe les APK debug (keystore debug), démarre deux émulateurs Android (KVM) et laisse opencode les piloter (`adb` + scripts e2e) contre le vrai staging. Secrets requis sur galass-ci : `GALASS_STAGING_URL`, `GALASS_E2E_RIDER_TOKEN`, `GALASS_E2E_DRIVER_TOKEN`, `GALASS_E2E_DEV_TOKEN`, `DEBUG_KEYSTORE_B64` (à poser par Papa, jamais dans les logs). Pas de FreeLLM : les modèles restent `opencode/*-free`. Si Artemis est utilisé, uniquement sous opencode, pas d'appel HTTP direct. |
+| `with_emulators` | Défaut `false`. Si `true`, opencode reçoit l'outil figé `/opt/fullrun-tools/emu-e2e.sh`, qui déclenche `artemis-staging-e2e.yml` sur `LordThiouk/galass-emu-actions-pub` (les secrets e2e restent dans ce dépôt : rien à poser sur galass-ci), avec `rider_ref`/`driver_ref` = la branche de travail du FullRun si elle existe sur le dépôt, sinon `main`. L'outil attend la fin (délai borné), rend le verdict et, en échec, un court extrait des logs. opencode peut corriger et relancer en boucle. Le jeton utilisé est `GALASS_TOKEN` (hors de l'environnement d'opencode). Pas de FreeLLM : les modèles FullRun restent `opencode/*-free` ; Artemis côté emu reçoit `deepseek-v4.1-flash-free`. Prérequis : [PR emu #5](https://github.com/LordThiouk/galass-emu-actions-pub/pull/5) (API opencode `*-free`, risque 403) et le droit Actions write du jeton sur le dépôt emu. |
 
 Ou en CLI :
 
