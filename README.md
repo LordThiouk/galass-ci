@@ -74,13 +74,15 @@ Onglet Actions → `opencode FullRun` → `Run workflow` :
 | `isa_path` | `MEMORY/WORK/<dossier>/ISA.md`, ou vide (déduite du prompt). |
 | `base_branch` | Cible de la PR en brouillon (vide = branche par défaut du dépôt concerné). |
 | `idle_minutes` / `wip_push_minutes` | Silence max et rythme de push des wip (dépôt cible). |
+| `with_emulators` | Défaut `false`. Si `true`, le job complète au besoin `extra_repos` avec `Galass_Rider`, `Galass_Driver` et `galass-emu-actions-pub` (sauf le `target_repo`), compile et installe les APK debug (keystore debug), démarre deux émulateurs Android (KVM) et laisse opencode les piloter (`adb` + scripts e2e) contre le vrai staging. Secrets requis sur galass-ci : `GALASS_STAGING_URL`, `GALASS_E2E_RIDER_TOKEN`, `GALASS_E2E_DRIVER_TOKEN`, `GALASS_E2E_DEV_TOKEN`, `DEBUG_KEYSTORE_B64` (à poser par Papa, jamais dans les logs). Pas de FreeLLM : les modèles restent `opencode/*-free`. Si Artemis est utilisé, uniquement sous opencode, pas d'appel HTTP direct. |
 
 Ou en CLI :
 
 ```
 gh workflow run opencode-fullrun.yml -R LordThiouk/galass-ci \
   -f target_repo=Galass_backend -f extra_repos=Galass_Rider,Galass_Driver,galass-emu-actions-pub \
-  -f branch=… -f prompt_path=prompts:… -f job_name=…
+  -f branch=… -f prompt_path=prompts:… -f job_name=… \
+  -F with_emulators=true
 ```
 
 **À la fin du run.** Contrôles (gitleaks, clé ISA, branche, historique) puis push de ce

@@ -4,6 +4,10 @@ run-name: FullRun ${{ inputs.job_name }} → ${{ inputs.target_repo }}@${{ input
 # Longs jobs opencode (FullRun LifeOS) pour un dépôt Galass choisi par target_repo
 # (Galass_Driver, Galass_Rider, Galass_backend ou galass-emu-actions-pub).
 # Des dépôts supplémentaires optionnels (extra_repos) sont récupérés à côté, même branche.
+# with_emulators (défaut false) : démarre les émulateurs Rider et Driver avant opencode
+# (KVM, APK debug, vrai staging). opencode les pilote ; pas de FreeLLM, pas d'appel HTTP
+# direct à un modèle. Les gardes FullRun (modèles opencode/*-free, liste blanche, hooks,
+# plafond mémoire) restent inchangées.
 # Dépôt PUBLIC : logs visibles par tous. La sortie d'opencode reste dans un fichier du
 # runner, jamais affichée ni publiée en artifact. Déclenchement manuel uniquement.
 on:
@@ -71,6 +75,11 @@ on:
         description: "Push des commits wip de la branche toutes les N min pendant le run (5 à 120)"
         type: string
         default: "30"
+      with_emulators:
+        description: "Si true, démarre les émulateurs Android Rider et Driver avant opencode (KVM, vrai staging, scripts e2e). Défaut false."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -116,6 +125,7 @@ jobs:
       TARGET_DIR: ${{ github.workspace }}/target
       TARGET_GIT: https://github.com/LordThiouk/${{ inputs.target_repo }}.git
       IN_EXTRA: ${{ inputs.extra_repos }}
+      WITH_EMULATORS: ${{ inputs.with_emulators }}
       EXTRA_ROOT: ${{ github.workspace }}/extra
       CI_DIR: ${{ github.workspace }}/ci
       OPENCODE_DISABLE_AUTOUPDATE: "1"
@@ -185,12 +195,30 @@ jobs:
           set +x
           fail() { echo "::error::$1"; exit 1; }
           [ -f "$CI_DIR/opencode/extra-repos.sh" ] || fail "extra-repos.sh absent : impossible de valider extra_repos"
-          if ! extras=$(EXTRA_REPOS_RAW="${IN_EXTRA:-}" TARGET_REPO="$TARGET_REPO"                  "$CI_DIR/opencode/extra-repos.sh" parse 2>"$RUNNER_TEMP/extra-parse.err"); then
+          raw="${IN_EXTRA:-}"
+          if [ "${WITH_EMULATORS:-}" = "true" ]; then
+            [ -f "$CI_DIR/opencode/emulators.sh" ] || fail "emulators.sh absent : impossible d'activer with_emulators"
+            raw=$(WITH_EMULATORS=true TARGET_REPO="$TARGET_REPO" EXTRA_REPOS_RAW="${IN_EXTRA:-}" \
+              "$CI_DIR/opencode/emulators.sh" merge-extras) || fail "with_emulators : extras invalides"
+          fi
+          if ! extras=$(EXTRA_REPOS_RAW="$raw" TARGET_REPO="$TARGET_REPO"                  "$CI_DIR/opencode/extra-repos.sh" parse 2>"$RUNNER_TEMP/extra-parse.err"); then
             err=$(tr -d '\r' < "$RUNNER_TEMP/extra-parse.err" | head -n1)
             fail "${err:-extra_repos invalide}"
           fi
           echo "EXTRA_REPOS=$extras" >> "$GITHUB_ENV"
           if [ -n "$extras" ]; then echo "Dépôts supplémentaires : $extras"; else echo "Aucun dépôt supplémentaire"; fi
+
+      - name: Garde des secrets e2e (si with_emulators)
+        if: inputs.with_emulators
+        env:
+          GALASS_STAGING_URL: ${{ secrets.GALASS_STAGING_URL }}
+          GALASS_E2E_RIDER_TOKEN: ${{ secrets.GALASS_E2E_RIDER_TOKEN }}
+          GALASS_E2E_DRIVER_TOKEN: ${{ secrets.GALASS_E2E_DRIVER_TOKEN }}
+          GALASS_E2E_DEV_TOKEN: ${{ secrets.GALASS_E2E_DEV_TOKEN }}
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          set +x
+          "$CI_DIR/opencode/emulators.sh" guard-secrets
 
       - name: Checkout du dépôt cible (lecture seule)
         uses: actions/checkout@v4
@@ -387,6 +415,42 @@ jobs:
           cat "$p" >> "$OC_WORK/prompt.md"
           echo "Prompt prêt ($(wc -l < "$OC_WORK/prompt.md") lignes), base $(git rev-parse --short HEAD)"
 
+      - name: Libérer du disque (émulateurs)
+        if: inputs.with_emulators
+        run: |
+          set +x
+          "$CI_DIR/opencode/emulators.sh" free-disk
+
+      - name: Java 17 (builds APK)
+        if: inputs.with_emulators
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: SDK Android
+        if: inputs.with_emulators
+        uses: android-actions/setup-android@v3
+
+      - name: Flutter 3.44.8
+        if: inputs.with_emulators
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.8"
+          channel: stable
+          cache: true
+
+      - name: Préparer et démarrer les émulateurs Rider et Driver
+        if: inputs.with_emulators
+        env:
+          GALASS_STAGING_URL: ${{ secrets.GALASS_STAGING_URL }}
+          GALASS_E2E_RIDER_TOKEN: ${{ secrets.GALASS_E2E_RIDER_TOKEN }}
+          GALASS_E2E_DRIVER_TOKEN: ${{ secrets.GALASS_E2E_DRIVER_TOKEN }}
+          GALASS_E2E_DEV_TOKEN: ${{ secrets.GALASS_E2E_DEV_TOKEN }}
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          set +x
+          "$CI_DIR/opencode/emulators.sh" setup
 
       # Avant opencode : gitleaks (épinglé, sha256 vérifié), les scripts de masquage, de chiffrement,
       # du journal en direct, des dépôts supplémentaires, et le destinataire age sont copiés en root
@@ -408,7 +472,7 @@ jobs:
           sudo install -o root -g root -m 0755 "$RUNNER_TEMP/gl/gitleaks" "$CI_DIR/opencode/redact-log.sh" \
             "$CI_DIR/opencode/leaklog.sh" "$CI_DIR/opencode/livelog.sh" "$CI_DIR/opencode/progress.sh" \
             "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" \
-            "$CI_DIR/opencode/extra-repos.sh" "$T/"
+            "$CI_DIR/opencode/extra-repos.sh" "$CI_DIR/opencode/emulators.sh" "$T/"
           # Sourcé par extra-repos.sh, wippush.sh et livelog.sh depuis $T (pas le cwd).
           sudo install -o root -g root -m 0644 "$CI_DIR/opencode/allowed-repos.sh" "$CI_DIR/opencode/log-recipient.txt" "$T/"
           rm -rf "$RUNNER_TEMP/gl" "$f"
@@ -602,6 +666,12 @@ jobs:
           OC_PROGRESS_INTERVAL: "600"
           OC_LIVE_BRANCH: ${{ steps.live.outputs.branch }}
           BASE_SHA: ${{ steps.prep.outputs.base }}
+          # Secrets e2e : uniquement si with_emulators (jamais affichés). Pas de clé modèle HTTP.
+          BASE: ${{ inputs.with_emulators && secrets.GALASS_STAGING_URL || '' }}
+          GALASS_STAGING_URL: ${{ inputs.with_emulators && secrets.GALASS_STAGING_URL || '' }}
+          RIDER_TOKEN: ${{ inputs.with_emulators && secrets.GALASS_E2E_RIDER_TOKEN || '' }}
+          DRIVER_TOKEN: ${{ inputs.with_emulators && secrets.GALASS_E2E_DRIVER_TOKEN || '' }}
+          DEV_TOKEN: ${{ inputs.with_emulators && secrets.GALASS_E2E_DEV_TOKEN || '' }}
         run: |
           set +x
           # Suivi : lignes [suivi] à valeurs filtrées (liste blanche / nombres), jamais le log lui-même.
@@ -656,6 +726,16 @@ jobs:
             exit 1
           fi
 
+      - name: Arrêter les émulateurs
+        if: always() && inputs.with_emulators
+        run: |
+          set +x
+          if [ -x /opt/fullrun-tools/emulators.sh ]; then
+            /opt/fullrun-tools/emulators.sh stop
+          elif [ -x "$CI_DIR/opencode/emulators.sh" ]; then
+            "$CI_DIR/opencode/emulators.sh" stop
+          fi
+
       - name: Rapport, journal privé et contrôles avant push
         id: check
         if: always() && steps.prep.outputs.base != ''
@@ -696,7 +776,7 @@ jobs:
           cd "$TARGET_DIR"
           # Outils figés avant opencode (root) : gitleaks, masquage, chiffrement, destinataire age.
           T=/opt/fullrun-tools; L=/opt/fullrun-live
-          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh extra-repos.sh allowed-repos.sh log-recipient.txt; do
+          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh extra-repos.sh emulators.sh allowed-repos.sh log-recipient.txt; do
             [ -f "$T/$tool" ] || { echo "::error::outil figé absent ($tool) : push refusé"; exit 1; }
           done
           # Artefact chiffré (journal + rapport gitleaks) : publié seulement si un contrôle refuse.
