@@ -267,4 +267,170 @@ find "$tmp" -type f ! -name 'out-token.txt' -print0 | xargs -0 grep -qaF -- "$fa
 # xargs grep sur $tmp ne devrait rien trouver. Si le ko se déclenche, c'est une fuite.
 ok "jeton absent des sorties, de l'état et des dépôts"
 
-echo "PASS extra-repos : parse, checkout, push propre, secret, clé ISA, workflows, non-ff, main, PR brouillon, jeton caché"
+# --- 13. clone et fetch authentifiés ; masque base64 sur stdout ---------------
+# Faux git en tête du PATH : toute commande clone/fetch/pull sans en-tête d'auth échoue.
+# Les URL https://github.com/LordThiouk/<repo>.git sont réécrites vers le dépôt nu local.
+mkrepo Galass_backend main
+bseed="$tmp/seed-Galass_backend"
+git -C "$bseed" checkout -q -b feat/ms
+printf 'auth\n' > "$bseed/auth.txt"
+git -C "$bseed" add auth.txt && git -C "$bseed" commit -qm "feat start"
+git -C "$bseed" push -q "$src/Galass_backend.git" "HEAD:refs/heads/feat/ms"
+
+fakebin="$tmp/fakebin"; mkdir -p "$fakebin"
+authlog="$tmp/fake-git.log"; : > "$authlog"
+# Chemins injectés après coup : run_git auth lance git via env -i (plus de variables du test).
+cat > "$fakebin/git" <<'FG'
+#!/usr/bin/env bash
+log="__LOG__"
+src_root="__SRC__"
+real=/usr/bin/git
+auth=0
+i=0
+while [ "$i" -lt "${GIT_CONFIG_COUNT:-0}" ]; do
+  eval "k=\${GIT_CONFIG_KEY_$i-}"
+  eval "v=\${GIT_CONFIG_VALUE_$i-}"
+  case "$k" in
+    http.*.extraheader)
+      case "$v" in
+        AUTHORIZATION:\ basic\ *) auth=1 ;;
+      esac
+      ;;
+  esac
+  i=$((i + 1))
+done
+is_net=0
+skip=0
+args=()
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then skip=0; args+=("$a"); continue; fi
+  case "$a" in
+    -C|--git-dir|--work-tree|--namespace) skip=1; args+=("$a"); continue ;;
+    clone|fetch|pull|push|ls-remote) is_net=1 ;;
+  esac
+  # Réécriture seulement pour les commandes réseau : un set-url https doit rester nu.
+  if [ "$is_net" = 1 ]; then
+    case "$a" in
+      https://github.com/LordThiouk/*.git|https://github.com/LordThiouk/*)
+        repo=${a##*/}; repo=${repo%.git}
+        a="file://${src_root}/${repo}.git"
+        ;;
+    esac
+  fi
+  args+=("$a")
+done
+printf '%s %s\n' "$auth" "${args[*]}" >> "$log"
+if [ "$is_net" = 1 ] && [ "$auth" != 1 ]; then
+  echo UNAUTH >> "$log"
+  echo "fetch/clone/pull sans en-tête d'authentification" >&2
+  exit 1
+fi
+# fetch/pull origin lit l'URL dans la config (https nue) : insteadOf la redirige en file://.
+exec "$real" -c "url.file://${src_root}/.insteadOf=https://github.com/LordThiouk/" "${args[@]}"
+FG
+# shellcheck disable=SC2016
+sed -i "s|__LOG__|$authlog|g; s|__SRC__|$src|g" "$fakebin/git"
+chmod +x "$fakebin/git"
+authroot="$tmp/auth-root"; authstate="$tmp/auth-state"
+# Jeton seulement sur stdin, pas dans un fichier du $tmp (le test 12 a déjà scanné).
+GITHUB_ACTIONS=1 PATH="$fakebin:$PATH" EXTRA_GIT="$fakebin/git" EXTRA_TOKEN_STDIN=1 \
+  IN_BRANCH=feat/ms EXTRA_REPOS=Galass_backend TARGET_REPO=Galass_Driver \
+  EXTRA_ROOT="$authroot" EXTRA_STATE="$authstate" \
+  "$script" checkout > "$out" 2>"$tmp/err.txt" <<< "$fake_token" \
+  || ko "checkout authentifié en échec : $(cat "$tmp/err.txt") $(cat "$out")"
+[ -f "$authroot/Galass_backend/auth.txt" ] || ko "checkout authentifié incomplet"
+grep -qE '(^| )clone ' "$authlog" || ko "clone absent du journal du faux git"
+grep -qE '(^| )fetch ' "$authlog" || ko "fetch absent du journal du faux git"
+# Chaque clone/fetch/pull doit avoir été authentifié (premier champ = 1).
+while read -r flag rest; do
+  [ "$flag" = UNAUTH ] && ko "clone/fetch/pull sans auth : $rest"
+  case " $rest " in
+    *" clone "*|*" fetch "*|*" pull "*)
+      [ "$flag" = 1 ] || ko "commande réseau sans auth : $flag $rest"
+      ;;
+  esac
+done < "$authlog"
+grep -q '^UNAUTH' "$authlog" && ko "UNAUTH dans le journal du faux git"
+b64=$(printf 'x-access-token:%s' "$fake_token" | base64 -w0)
+grep -qF -- "::add-mask::$b64" "$out" || ko "masque base64 absent de stdout (add-mask non enregistré) : $(cat "$out")"
+grep -qF -- "$fake_token" "$out" "$tmp/err.txt" && ko "jeton en clair dans la sortie du checkout authentifié"
+ok "checkout : clone et fetch authentifiés, masque base64 sur stdout"
+
+# --- 14. wip périodique des extra : propre, secret bloqué, main refusée -------
+mkrepo galass-emu-actions-pub main
+# Checkout file:// (sans réseau) sur une branche de fonctionnalité neuve.
+rm -rf "$root/galass-emu-actions-pub"
+IN_BRANCH=feat/ms EXTRA_REPOS=galass-emu-actions-pub TARGET_REPO=Galass_backend \
+  EXTRA_ROOT="$root" EXTRA_STATE="$state" EXTRA_SRC_DIR="$src" \
+  "$script" checkout > "$out" 2>"$tmp/err.txt" \
+  || ko "checkout emu pour wip en échec : $(cat "$tmp/err.txt")"
+printf 'wip-ok\n' > "$root/galass-emu-actions-pub/wip.txt"
+git -C "$root/galass-emu-actions-pub" add wip.txt
+git -C "$root/galass-emu-actions-pub" commit -qm "wip: ok"
+wipst="$tmp/extra-wip"
+IN_JOB=testjob IN_RUN=42 IN_BRANCH=feat/ms EXTRA_REPOS=galass-emu-actions-pub \
+  TARGET_REPO=Galass_backend EXTRA_ROOT="$root" EXTRA_STATE="$state" \
+  EXTRA_SRC_DIR="$src" EXTRA_WIP_STATE="$wipst" EXTRA_GITLEAKS="$gl" \
+  "$script" wip-once > "$out" 2>"$tmp/err.txt" \
+  || ko "wip-once propre en échec : $(cat "$tmp/err.txt") $(cat "$out")"
+emu_head=$(git -C "$root/galass-emu-actions-pub" rev-parse HEAD)
+[ "$(git -C "$src/galass-emu-actions-pub.git" rev-parse refs/heads/feat/ms)" = "$emu_head" ] \
+  || ko "wip-once n'a pas poussé la branche de fonctionnalité"
+grep -q 'wip poussé' "$out" "$wipst/galass-emu-actions-pub/status" \
+  || ko "ligne de suivi wip poussé absente : $(cat "$out")"
+ok "wip-once : commit propre poussé sur la branche de fonctionnalité"
+
+# Secret : non poussé, valeur absente, distant intact.
+sec2=$(fake_ghp)
+h_emu=$(git -C "$src/galass-emu-actions-pub.git" rev-parse refs/heads/feat/ms)
+printf 'export GITHUB_TOKEN=%s\n' "$sec2" > "$root/galass-emu-actions-pub/sec.txt"
+git -C "$root/galass-emu-actions-pub" add sec.txt
+git -C "$root/galass-emu-actions-pub" commit -qm "wip: secret"
+IN_JOB=testjob IN_RUN=42 IN_BRANCH=feat/ms EXTRA_REPOS=galass-emu-actions-pub \
+  TARGET_REPO=Galass_backend EXTRA_ROOT="$root" EXTRA_STATE="$state" \
+  EXTRA_SRC_DIR="$src" EXTRA_WIP_STATE="$wipst" EXTRA_GITLEAKS="$gl" \
+  "$script" wip-once > "$out" 2>"$tmp/err.txt" \
+  || ko "wip-once secret en échec inattendu (doit être non fatal) : $(cat "$tmp/err.txt")"
+grep -q 'secret probable' "$out" "$wipst/galass-emu-actions-pub/status" \
+  || ko "secret non signalé par wip-once : $(cat "$out")"
+[ "$(git -C "$src/galass-emu-actions-pub.git" rev-parse refs/heads/feat/ms)" = "$h_emu" ] \
+  || ko "secret poussé par wip-once"
+grep -rqaF -- "$sec2" "$out" "$tmp/err.txt" "$wipst" && ko "valeur du secret dans la sortie wip"
+git -C "$root/galass-emu-actions-pub" reset -q --hard "$h_emu"
+ok "wip-once : secret bloqué par gitleaks, non poussé"
+
+# main refusée ; aucun --force dans les arguments.
+IN_JOB=testjob IN_RUN=42 IN_BRANCH=main EXTRA_REPOS=galass-emu-actions-pub \
+  TARGET_REPO=Galass_backend EXTRA_ROOT="$root" EXTRA_STATE="$state" \
+  EXTRA_SRC_DIR="$src" EXTRA_WIP_STATE="$wipst" EXTRA_GITLEAKS="$gl" \
+  "$script" wip-once > "$out" 2>"$tmp/err.txt" && ko "wip-once accepté sur main"
+grep -q 'branche interdite' "$tmp/err.txt" || ko "refus de main non signalé : $(cat "$tmp/err.txt")"
+# Intercepter un passage propre : le vrai git derrière un shim ne doit jamais voir --force.
+force_shim="$tmp/force-shim"; mkdir -p "$force_shim"
+realgit=$(command -v git)
+cat > "$force_shim/git" <<SHIM
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$tmp/wip.argv"
+for a in "\$@"; do
+  case "\$a" in --force|--force-with-lease|-f) echo FORCE >> "$tmp/wip.argv"; exit 1 ;; esac
+done
+exec "$realgit" "\$@"
+SHIM
+chmod +x "$force_shim/git"
+printf 'wip2\n' >> "$root/galass-emu-actions-pub/wip.txt"
+git -C "$root/galass-emu-actions-pub" add wip.txt
+git -C "$root/galass-emu-actions-pub" commit -qm "wip: 2"
+: > "$tmp/wip.argv"
+IN_JOB=testjob IN_RUN=42 IN_BRANCH=feat/ms EXTRA_REPOS=galass-emu-actions-pub \
+  TARGET_REPO=Galass_backend EXTRA_ROOT="$root" EXTRA_STATE="$state" \
+  EXTRA_SRC_DIR="$src" EXTRA_WIP_STATE="$wipst" EXTRA_GITLEAKS="$gl" \
+  PATH="$force_shim:$PATH" \
+  "$script" wip-once > "$out" 2>"$tmp/err.txt" \
+  || ko "wip-once (contrôle force) en échec : $(cat "$tmp/err.txt") $(cat "$out")"
+grep -q FORCE "$tmp/wip.argv" && ko "wip-once a utilisé --force"
+emu_head2=$(git -C "$root/galass-emu-actions-pub" rev-parse HEAD)
+[ "$(git -C "$src/galass-emu-actions-pub.git" rev-parse refs/heads/feat/ms)" = "$emu_head2" ] \
+  || ko "second wip non poussé"
+ok "wip-once : main refusée, aucun force"
+
+echo "PASS extra-repos : parse, checkout, push propre, secret, clé ISA, workflows, non-ff, main, PR brouillon, jeton caché, fetch authentifié, wip périodique"

@@ -135,23 +135,8 @@ jobs:
             Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) ;;
             *) fail "target_repo invalide (Galass_Driver, Galass_Rider, Galass_backend ou galass-emu-actions-pub)" ;;
           esac
-          # extra_repos : liste optionnelle, virgules, pas de doublon, pas le dépôt cible.
-          extras=""
-          IFS=',' read -r -a ers <<<"${IN_EXTRA:-}"
-          for r in "${ers[@]}"; do
-            r="${r//[[:space:]]/}"
-            [ -n "$r" ] || continue
-            case "$r" in
-              Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) ;;
-              *) fail "extra_repos invalide (Galass_Driver, Galass_Rider, Galass_backend ou galass-emu-actions-pub)" ;;
-            esac
-            [ "$r" != "$TARGET_REPO" ] || fail "extra_repos ne peut pas répéter target_repo"
-            case ",$extras," in
-              *",$r,"*) fail "extra_repos : dépôt en double" ;;
-            esac
-            extras="${extras:+$extras,}$r"
-          done
-          echo "EXTRA_REPOS=$extras" >> "$GITHUB_ENV"
+          # extra_repos : validé après le checkout de galass-ci, via extra-repos.sh parse
+          # (liste blanche unique, pas de copie dans ce workflow).
           [[ "$IN_LIFEOS_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ && "$IN_LIFEOS_REF" != *..* ]] || fail "lifeos_ref invalide"
           if [ -n "$OC_ISA_PATH" ]; then
             [[ "$OC_ISA_PATH" =~ ^MEMORY/WORK/[A-Za-z0-9._-]+/ISA\.md$ && "$OC_ISA_PATH" != *..* ]] \
@@ -198,6 +183,18 @@ jobs:
         with:
           path: ci
           persist-credentials: false
+
+      - name: Valider extra_repos (liste blanche du script)
+        run: |
+          set +x
+          fail() { echo "::error::$1"; exit 1; }
+          [ -f "$CI_DIR/opencode/extra-repos.sh" ] || fail "extra-repos.sh absent : impossible de valider extra_repos"
+          if ! extras=$(EXTRA_REPOS_RAW="${IN_EXTRA:-}" TARGET_REPO="$TARGET_REPO"                  "$CI_DIR/opencode/extra-repos.sh" parse 2>"$RUNNER_TEMP/extra-parse.err"); then
+            err=$(tr -d '\r' < "$RUNNER_TEMP/extra-parse.err" | head -n1)
+            fail "${err:-extra_repos invalide}"
+          fi
+          echo "EXTRA_REPOS=$extras" >> "$GITHUB_ENV"
+          if [ -n "$extras" ]; then echo "Dépôts supplémentaires : $extras"; else echo "Aucun dépôt supplémentaire"; fi
 
       - name: Checkout du dépôt cible (lecture seule)
         uses: actions/checkout@v4
@@ -512,6 +509,52 @@ jobs:
           echo -500 | sudo -n tee "/proc/$pid/oom_score_adj" >/dev/null 2>&1 || true
           echo "- Push des wip : branche \`$IN_BRANCH\` toutes les ${IN_WIP_PUSH_MIN} min (gitleaks + clé ISA avant chaque envoi)" >> "$GITHUB_STEP_SUMMARY"
           echo "Push périodique des wip démarré (toutes les ${IN_WIP_PUSH_MIN} min)"
+          # Dépôts supplémentaires : un démon wippush par dépôt, même cadence, mêmes garde-fous
+          # (gitleaks, clé ISA, jamais main, jamais --force). Le jeton arrive sur stdin.
+          if [ -n "${EXTRA_REPOS:-}" ] && [ -n "${EXTRA_STATE:-}" ]; then
+            sudo -n install -d -o root -g root -m 0755 /opt/fullrun-wip-extra \
+              || { echo "::warning::dossier wip extra inaccessible : pas de push périodique des extra"; exit 0; }
+            IFS=',' read -r -a _ers <<<"$EXTRA_REPOS"
+            for r in "${_ers[@]}"; do
+              r="${r//[[:space:]]/}"
+              [ -n "$r" ] || continue
+              # Noms déjà filtrés par parse ; garde de chemin seulement (pas de seconde liste blanche).
+              [[ "$r" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$ ]] || continue
+              if [ ! -d "$EXTRA_ROOT/$r/.git" ]; then
+                echo "::warning::$r : checkout absent, pas de push périodique"
+                continue
+              fi
+              b=$(tr -dc '0-9a-f' < "$EXTRA_STATE/$r.base" 2>/dev/null || true)
+              if ! [[ "$b" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::warning::$r : SHA de départ absent, pas de push périodique"
+                continue
+              fi
+              Lx="/opt/fullrun-wip-extra/$r"
+              sudo -n install -d -o root -g root -m 0755 "$Lx" || continue
+              # shellcheck disable=SC2024
+              printf '%s\n' "$PUSH_TOKEN" | sudo -n env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$Lx" \
+                WIP_STATE="$Lx" WIP_REPO="$EXTRA_ROOT/$r" WIP_BRANCH="$IN_BRANCH" \
+                WIP_JOB="$IN_JOB" WIP_RUN="$RUN_ID" \
+                WIP_REMOTE="https://github.com/LordThiouk/${r}.git" \
+                WIP_BASE_SHA="$b" WIP_GITLEAKS="$T/gitleaks" WIP_GL_CONFIG="$gcfg" \
+                WIP_GL_IGNORE="$T/gitleaks-ignore" WIP_ISA_KEY_FILE=/opt/fullrun-live/isa.key \
+                WIP_TOKEN_STDIN=1 IN_WIP_PUSH_MIN="$IN_WIP_PUSH_MIN" \
+                setsid -f nice -n 0 "$T/wippush.sh" daemon > "$RUNNER_TEMP/wip-extra-$r.out" 2>&1 &
+              okx=0
+              for _ in 1 2 3 4 5 6 7 8 9 10; do
+                pid=$(sudo -n cat "$Lx/pid" 2>/dev/null || true)
+                if [[ "$pid" =~ ^[0-9]{1,9}$ ]] && sudo -n kill -0 "$pid" 2>/dev/null; then okx=1; break; fi
+                sleep 1
+              done
+              if [ "$okx" = 1 ]; then
+                echo -500 | sudo -n tee "/proc/$pid/oom_score_adj" >/dev/null 2>&1 || true
+                echo "- Push des wip ($r) : branche \`$IN_BRANCH\` toutes les ${IN_WIP_PUSH_MIN} min" >> "$GITHUB_STEP_SUMMARY"
+                echo "Push périodique des wip démarré pour $r (toutes les ${IN_WIP_PUSH_MIN} min)"
+              else
+                echo "::warning::démon de push périodique non démarré pour $r : le run continue sans"
+              fi
+            done
+          fi
 
       # Priorité mémoire (best-effort, jamais fatal) : si le runner sature, opencode meurt le
       # premier ; Runner.Worker et les superviseurs des démons restent pour écrire le rapport.
@@ -522,7 +565,8 @@ jobs:
           for p in $(pgrep -f '[R]unner.Worker' 2>/dev/null || true); do
             echo -500 | sudo -n tee "/proc/$p/oom_score_adj" >/dev/null 2>&1 || true
           done
-          for f in /opt/fullrun-live/pid /opt/fullrun-wip/pid; do
+          for f in /opt/fullrun-live/pid /opt/fullrun-wip/pid /opt/fullrun-wip-extra/*/pid; do
+            [ -e "$f" ] || continue
             p=$(sudo -n cat "$f" 2>/dev/null || true)
             if [[ "$p" =~ ^[0-9]{1,9}$ ]]; then
               echo -500 | sudo -n tee "/proc/$p/oom_score_adj" >/dev/null 2>&1 || true
@@ -671,8 +715,8 @@ jobs:
             st=$(sudo -n cat "$L/status" 2>/dev/null || true)
             echo "- Journal en direct : $(grep -c 'envoyé (clair)' <<<"$st") instantané(s) en clair, $(grep -c 'envoyé (chiffré)' <<<"$st") chiffré(s), $(grep -c 'envoi impossible\|non envoyé\|échec' <<<"$st") échec(s)" >> "$GITHUB_STEP_SUMMARY"
           fi
-          # Push périodique des wip : démon arrêté (il finit le passage en cours), puis reprise du
-          # dernier SHA poussé : base du scan final, et pas de double push.
+          # Push périodique des wip : démons arrêtés (ils finissent le passage en cours), puis
+          # reprise du dernier SHA poussé : base du scan final, et pas de double push.
           wip_tip=""; wpush=0
           if pid=$(sudo -n cat /opt/fullrun-wip/pid 2>/dev/null) && [[ "$pid" =~ ^[0-9]{1,9}$ ]]; then
             sudo -n kill -TERM "$pid" 2>/dev/null || true
@@ -688,6 +732,29 @@ jobs:
             grep -E '^\[suivi\] wip (poussé|non poussé|démarré|arrêté)' <<<"$wst" | tail -n 40 || true
             echo "- Push des wip : ${wpush} push(s) pendant le run$([ -n "$wip_tip" ] && echo ", dernier SHA ${wip_tip:0:7}")" >> "$GITHUB_STEP_SUMMARY"
           fi
+          # Démons wip des dépôts supplémentaires : TERM à tous d'abord, puis attente, puis KILL.
+          extra_pids=""
+          for pf in /opt/fullrun-wip-extra/*/pid; do
+            [ -e "$pf" ] || continue
+            pid=$(sudo -n cat "$pf" 2>/dev/null || true)
+            if [[ "$pid" =~ ^[0-9]{1,9}$ ]]; then
+              sudo -n kill -TERM "$pid" 2>/dev/null || true
+              extra_pids="$extra_pids $pid"
+            fi
+          done
+          for pid in $extra_pids; do
+            for _ in $(seq 1 75); do sudo -n kill -0 "$pid" 2>/dev/null || break; sleep 2; done
+            sudo -n kill -KILL "$pid" 2>/dev/null || true
+          done
+          for pf in /opt/fullrun-wip-extra/*/pid; do
+            [ -e "$pf" ] || continue
+            wst=$(sudo -n cat "$(dirname "$pf")/status" 2>/dev/null || true)
+            wpush_x=$(grep -c 'wip poussé' <<<"$wst" || true)
+            rname=$(basename "$(dirname "$pf")")
+            [[ "$rname" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$ ]] || continue
+            grep -E '^\[suivi\] wip (poussé|non poussé|démarré|arrêté)' <<<"$wst" | tail -n 40 || true
+            echo "- Push des wip ($rname) : ${wpush_x} push(s) pendant le run" >> "$GITHUB_STEP_SUMMARY"
+          done
           # Clé ISA prise du secret (pas du fichier de $HOME, modifiable par l'IA).
           K="$OC_WORK/isa-check.key"; ( umask 077; printf '%s' "${ISA_STAMP_KEY:-}" > "$K" )
           trap 'rm -f "$K" "$OC_WORK/run.diff" "$OC_WORK/log.redacted" "$OC_WORK/log.index"' EXIT

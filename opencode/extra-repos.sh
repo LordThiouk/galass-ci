@@ -5,12 +5,15 @@
 #   extra-repos.sh check     garde-fous + gitleaks + clé ISA ; écrit l'état (dépôt modifié ou non)
 #   extra-repos.sh push      pousse la branche de fonctionnalité des dépôts propres et modifiés
 #   extra-repos.sh pr        ouvre une PR en brouillon par dépôt poussé (jamais fusionnée)
+#   extra-repos.sh wip-once  un passage de push périodique (wippush) par dépôt supplémentaire
 # Jamais de push sur main/master, jamais de --force, jamais de jeton dans une URL, un argument,
 # un fichier ou la sortie. Ne sort aucune valeur de secret. Le journal fullrun-logs reste dans
 # le dépôt cible : ce script ne touche pas aux branches fullrun-logs/* ni fullrun-prompts.
 set +x
 set -uo pipefail
 
+# Liste blanche unique des dépôts Galass (cible et extra_repos). Le workflow appelle parse
+# plutôt que de recopier cette liste.
 allowed_repo() {
   case "$1" in
     Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) return 0 ;;
@@ -67,8 +70,9 @@ git_auth_env() {
   local auth
   auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
   # Masque côté Actions si le hook est dispo ; no-op ailleurs (tests).
+  # stdout : Actions n'enregistre le masque que s'il transite par le flux du step.
   if [ -n "${GITHUB_ACTIONS:-}" ]; then
-    echo "::add-mask::$auth" >/dev/null 2>&1 || true
+    echo "::add-mask::$auth"
   fi
   AUTH_HEADER="AUTHORIZATION: basic $auth"
 }
@@ -144,14 +148,18 @@ checkout() {
     if [ -n "${EXTRA_SRC_DIR:-}" ]; then
       # Tests locaux : clone depuis un dépôt nu file://, sans jeton.
       git clone -q --no-checkout "$src" "$dir" || fail "clone impossible (dépôt supplémentaire)"
+      git -C "$dir" remote set-url origin "$src"
+      git -C "$dir" fetch -q --no-tags origin '+refs/heads/*:refs/remotes/origin/*' \
+        || fail "fetch impossible (dépôt supplémentaire)"
     else
+      # Clone ET fetch authentifiés (en-tête via l'environnement du process, jamais dans l'URL).
+      # On ne retire l'en-tête local éventuel qu'après le fetch : un fetch nu échoue sur un dépôt privé.
       run_git auth clone -q --no-checkout "$src" "$dir" || fail "clone impossible (dépôt supplémentaire)"
+      git -C "$dir" remote set-url origin "$src"
+      run_git auth -C "$dir" fetch -q --no-tags origin '+refs/heads/*:refs/remotes/origin/*' \
+        || fail "fetch impossible (dépôt supplémentaire)"
+      git -C "$dir" config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
     fi
-    # Retirer toute trace d'identifiants : remote en URL https nue (ou file:// en test).
-    git -C "$dir" remote set-url origin "$src"
-    git -C "$dir" config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
-    git -C "$dir" fetch -q --no-tags origin '+refs/heads/*:refs/remotes/origin/*' \
-      || fail "fetch impossible (dépôt supplémentaire)"
     if git -C "$dir" rev-parse --verify -q "origin/$IN_BRANCH" >/dev/null; then
       git -C "$dir" checkout -q -B "$IN_BRANCH" "origin/$IN_BRANCH"
     else
@@ -382,6 +390,68 @@ pr_extras() {
   done
 }
 
+# --- wip périodique -----------------------------------------------------------
+# Un passage wippush.sh once par dépôt supplémentaire : même garde-fous (gitleaks,
+# clé ISA, jamais main, jamais --force). Les échecs sont des lignes [suivi], jamais fatals.
+wip_once() {
+  : "${EXTRA_ROOT:?}" "${IN_BRANCH:?}" "${EXTRA_STATE:?}"
+  valid_branch "$IN_BRANCH" || fail "branche interdite : wip refusé"
+  local list repos r dir base wipsh st remote job run
+  list="${EXTRA_REPOS-}"
+  [ -n "$list" ] || { echo "Aucun dépôt supplémentaire"; return 0; }
+  wipsh="${EXTRA_WIPPUSH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wippush.sh}"
+  [ -f "$wipsh" ] || fail "wippush.sh introuvable"
+  job="${IN_JOB:-${WIP_JOB:-wipjob}}"
+  run="${IN_RUN:-${WIP_RUN:-1}}"
+  read_token
+  IFS=',' read -r -a repos <<<"$list"
+  for r in "${repos[@]}"; do
+    r="${r//[[:space:]]/}"
+    allowed_repo "$r" || fail "dépôt supplémentaire non autorisé"
+    dir="$EXTRA_ROOT/$r"
+    if [ ! -d "$dir/.git" ]; then
+      echo "[suivi] $r : checkout absent, wip ignoré"
+      continue
+    fi
+    if [ "$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" != "$IN_BRANCH" ]; then
+      echo "[suivi] $r : hors de $IN_BRANCH, wip ignoré"
+      continue
+    fi
+    base=$(read_state "$r" base 2>/dev/null || true)
+    st="${EXTRA_WIP_STATE:-${EXTRA_STATE}/wip}/$r"
+    mkdir -p "$st" || fail "état wip inaccessible"
+    if [ -n "${EXTRA_SRC_DIR:-}" ]; then
+      remote=$(src_for "$r")
+    else
+      remote=$(repo_url "$r")
+    fi
+    # Jeton uniquement sur stdin de wippush ; retiré de l'environnement du fils.
+    if [ -n "${TOKEN:-}" ]; then
+      printf '%s\n' "$TOKEN" | \
+        WIP_TOKEN_STDIN=1 \
+        WIP_STATE="$st" WIP_REPO="$dir" WIP_BRANCH="$IN_BRANCH" \
+        WIP_JOB="$job" WIP_RUN="$run" WIP_REMOTE="$remote" \
+        WIP_BASE_SHA="$base" \
+        WIP_GITLEAKS="${EXTRA_GITLEAKS:-${WIP_GITLEAKS:-gitleaks}}" \
+        WIP_GL_CONFIG="${WIP_GL_CONFIG:-}" \
+        WIP_GL_IGNORE="${WIP_GL_IGNORE:-}" \
+        WIP_ISA_KEY_FILE="${EXTRA_ISA_KEY_FILE:-${WIP_ISA_KEY_FILE:-}}" \
+        env -u TOKEN -u EXTRA_TOKEN -u AUTH_HEADER -u GALASS_TOKEN -u PUSH_TOKEN \
+        bash "$wipsh" once
+    else
+      WIP_TOKEN_STDIN=0 \
+        WIP_STATE="$st" WIP_REPO="$dir" WIP_BRANCH="$IN_BRANCH" \
+        WIP_JOB="$job" WIP_RUN="$run" WIP_REMOTE="$remote" \
+        WIP_BASE_SHA="$base" \
+        WIP_GITLEAKS="${EXTRA_GITLEAKS:-${WIP_GITLEAKS:-gitleaks}}" \
+        WIP_GL_CONFIG="${WIP_GL_CONFIG:-}" \
+        WIP_GL_IGNORE="${WIP_GL_IGNORE:-}" \
+        WIP_ISA_KEY_FILE="${EXTRA_ISA_KEY_FILE:-${WIP_ISA_KEY_FILE:-}}" \
+        bash "$wipsh" once </dev/null
+    fi
+  done
+}
+
 cmd="${1:-}"
 case "$cmd" in
   parse) parse ;;
@@ -389,5 +459,6 @@ case "$cmd" in
   check) check ;;
   push) push_extras ;;
   pr) pr_extras ;;
-  *) echo "usage: extra-repos.sh parse|checkout|check|push|pr" >&2; exit 2 ;;
+  wip-once) wip_once ;;
+  *) echo "usage: extra-repos.sh parse|checkout|check|push|pr|wip-once" >&2; exit 2 ;;
 esac
