@@ -16,8 +16,13 @@
 set +x
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ ! -f "$here/allowed-repos.sh" ]; then
+  echo "allowed-repos.sh introuvable : $here/allowed-repos.sh" >&2
+  exit 1
+fi
 # shellcheck source=opencode/allowed-repos.sh
 . "$here/allowed-repos.sh"
+type allowed_repo >/dev/null 2>&1 || { echo "allowed-repos.sh incomplet" >&2; exit 1; }
 : "${WIP_STATE:?}" "${WIP_REPO:?}" "${WIP_BRANCH:?}" "${WIP_JOB:?}" "${WIP_RUN:?}"
 if [ -n "${WIP_REMOTE:-}" ]; then
   REMOTE="$WIP_REMOTE"

@@ -12,10 +12,16 @@
 set +x
 set -uo pipefail
 
-# Liste blanche : opencode/allowed-repos.sh (sourcé). Pas de copie ici.
+# Liste blanche : allowed-repos.sh à côté de ce script (checkout galass-ci ou
+# copie figée dans /opt/fullrun-tools). Jamais le répertoire courant.
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ ! -f "$here/allowed-repos.sh" ]; then
+  echo "allowed-repos.sh introuvable : $here/allowed-repos.sh" >&2
+  exit 1
+fi
 # shellcheck source=opencode/allowed-repos.sh
 . "$here/allowed-repos.sh"
+type allowed_repo >/dev/null 2>&1 || { echo "allowed-repos.sh incomplet" >&2; exit 1; }
 
 valid_branch() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || return 1
