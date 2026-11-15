@@ -1,21 +1,28 @@
 name: opencode FullRun
 run-name: FullRun ${{ inputs.job_name }} → ${{ inputs.target_repo }}@${{ inputs.branch }}
 
-# Longs jobs opencode (FullRun LifeOS) pour un dépôt privé Galass
-# (Galass_Driver, Galass_Rider ou Galass_backend), choisi par l'entrée target_repo.
+# Longs jobs opencode (FullRun LifeOS) pour un dépôt Galass choisi par target_repo
+# (Galass_Driver, Galass_Rider, Galass_backend ou galass-emu-actions-pub).
+# Des dépôts supplémentaires optionnels (extra_repos) sont récupérés à côté, même branche.
 # Dépôt PUBLIC : logs visibles par tous. La sortie d'opencode reste dans un fichier du
 # runner, jamais affichée ni publiée en artifact. Déclenchement manuel uniquement.
 on:
   workflow_dispatch:
     inputs:
       target_repo:
-        description: "Dépôt Galass privé cible (Driver, Rider ou backend)"
+        description: "Dépôt Galass cible (Driver, Rider, backend ou tests e2e)"
         required: true
         type: choice
         options:
           - Galass_Driver
           - Galass_Rider
           - Galass_backend
+          - galass-emu-actions-pub
+      extra_repos:
+        description: "Dépôts supplémentaires, séparés par des virgules, parmi Galass_Driver, Galass_Rider, Galass_backend, galass-emu-actions-pub (vide = aucun). Même branche de fonctionnalité. Le journal fullrun-logs reste dans target_repo."
+        required: false
+        type: string
+        default: ""
       branch:
         description: "Branche de fonctionnalité du dépôt cible, déjà poussée (jamais main/master)"
         required: true
@@ -108,6 +115,8 @@ jobs:
       TARGET_REPO: ${{ inputs.target_repo }}
       TARGET_DIR: ${{ github.workspace }}/target
       TARGET_GIT: https://github.com/LordThiouk/${{ inputs.target_repo }}.git
+      IN_EXTRA: ${{ inputs.extra_repos }}
+      EXTRA_ROOT: ${{ github.workspace }}/extra
       CI_DIR: ${{ github.workspace }}/ci
       OPENCODE_DISABLE_AUTOUPDATE: "1"
     steps:
@@ -123,9 +132,26 @@ jobs:
           [[ "$IN_JOB" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail "job_name invalide"
           [[ "$IN_PROMPT" =~ ^(prompts|repo|ci):[A-Za-z0-9._/-]+$ && "$IN_PROMPT" != *..* ]] || fail "prompt_path invalide (prompts:<chemin>, repo:<chemin> ou ci:<chemin>)"
           case "$TARGET_REPO" in
-            Galass_Driver|Galass_Rider|Galass_backend) ;;
-            *) fail "target_repo invalide (Galass_Driver, Galass_Rider ou Galass_backend)" ;;
+            Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) ;;
+            *) fail "target_repo invalide (Galass_Driver, Galass_Rider, Galass_backend ou galass-emu-actions-pub)" ;;
           esac
+          # extra_repos : liste optionnelle, virgules, pas de doublon, pas le dépôt cible.
+          extras=""
+          IFS=',' read -r -a ers <<<"${IN_EXTRA:-}"
+          for r in "${ers[@]}"; do
+            r="${r//[[:space:]]/}"
+            [ -n "$r" ] || continue
+            case "$r" in
+              Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) ;;
+              *) fail "extra_repos invalide (Galass_Driver, Galass_Rider, Galass_backend ou galass-emu-actions-pub)" ;;
+            esac
+            [ "$r" != "$TARGET_REPO" ] || fail "extra_repos ne peut pas répéter target_repo"
+            case ",$extras," in
+              *",$r,"*) fail "extra_repos : dépôt en double" ;;
+            esac
+            extras="${extras:+$extras,}$r"
+          done
+          echo "EXTRA_REPOS=$extras" >> "$GITHUB_ENV"
           [[ "$IN_LIFEOS_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ && "$IN_LIFEOS_REF" != *..* ]] || fail "lifeos_ref invalide"
           if [ -n "$OC_ISA_PATH" ]; then
             [[ "$OC_ISA_PATH" =~ ^MEMORY/WORK/[A-Za-z0-9._-]+/ISA\.md$ && "$OC_ISA_PATH" != *..* ]] \
@@ -182,6 +208,27 @@ jobs:
           path: target
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Checkout des dépôts supplémentaires
+        id: extra
+        env:
+          GALASS_TOKEN: ${{ secrets.GALASS_TOKEN }}
+        run: |
+          set +x
+          if [ -z "${EXTRA_REPOS:-}" ]; then
+            echo "Aucun dépôt supplémentaire"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ -n "${GALASS_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/extra-state"
+          echo "EXTRA_STATE=$RUNNER_TEMP/extra-state" >> "$GITHUB_ENV"
+          printf '%s\n' "$GALASS_TOKEN" | EXTRA_TOKEN_STDIN=1 EXTRA_STATE="$RUNNER_TEMP/extra-state" \
+            IN_BRANCH="$IN_BRANCH" EXTRA_ROOT="$EXTRA_ROOT" EXTRA_REPOS="$EXTRA_REPOS" \
+            TARGET_REPO="$TARGET_REPO" "$CI_DIR/opencode/extra-repos.sh" checkout
+          n=0; IFS=',' read -r -a _ers <<<"$EXTRA_REPOS"; n="${#_ers[@]}"
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "Dépôts supplémentaires ($n) dans $EXTRA_ROOT/<nom>"
 
       - name: Checkout LifeOS (lecture seule)
         uses: actions/checkout@v4
@@ -339,14 +386,15 @@ jobs:
           git update-ref -d refs/remotes/origin/fullrun-prompts 2>/dev/null || true
           export OC_BRANCH="$IN_BRANCH" OC_JOB="$IN_JOB" OC_REPORT="$OC_WORK/REPORT.md"
           # shellcheck disable=SC2016 # liste de variables pour envsubst, pas une expansion
-          envsubst '$TARGET_DIR $TARGET_REPO $OC_BRANCH $OC_REPORT $OC_JOB $OC_MODEL_MAIN $OC_MODEL_MAX' \
+          envsubst '$TARGET_DIR $TARGET_REPO $OC_BRANCH $OC_REPORT $OC_JOB $OC_MODEL_MAIN $OC_MODEL_MAX $EXTRA_ROOT $EXTRA_REPOS' \
             < "$CI_DIR/opencode/ci-preamble.md" > "$OC_WORK/prompt.md"
           cat "$p" >> "$OC_WORK/prompt.md"
           echo "Prompt prêt ($(wc -l < "$OC_WORK/prompt.md") lignes), base $(git rev-parse --short HEAD)"
 
 
-      # Avant opencode : gitleaks (épinglé, sha256 vérifié), les scripts de masquage, de chiffrement
-      # et du journal en direct, et le destinataire age sont copiés en root dans /opt/fullrun-tools.
+      # Avant opencode : gitleaks (épinglé, sha256 vérifié), les scripts de masquage, de chiffrement,
+      # du journal en direct, des dépôts supplémentaires, et le destinataire age sont copiés en root
+      # dans /opt/fullrun-tools.
       # opencode ne peut plus les modifier (sans sudo) : les contrôles et l'artefact publié après le
       # run s'appuient sur ces copies, pas sur $CI_DIR (modifiable par opencode).
       - name: Outils de contrôle figés (root, avant opencode)
@@ -363,7 +411,8 @@ jobs:
           sudo install -d -o root -g root -m 0755 "$T" "$L"
           sudo install -o root -g root -m 0755 "$RUNNER_TEMP/gl/gitleaks" "$CI_DIR/opencode/redact-log.sh" \
             "$CI_DIR/opencode/leaklog.sh" "$CI_DIR/opencode/livelog.sh" "$CI_DIR/opencode/progress.sh" \
-            "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" "$T/"
+            "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" \
+            "$CI_DIR/opencode/extra-repos.sh" "$T/"
           sudo install -o root -g root -m 0644 "$CI_DIR/opencode/log-recipient.txt" "$T/"
           rm -rf "$RUNNER_TEMP/gl" "$f"
           # Config gitleaks du dépôt cible au SHA de départ (même règle que le contrôle avant push).
@@ -925,7 +974,7 @@ jobs:
           [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA contrôlé absent : push refusé"; exit 1; }
           [ -n "${PUSH_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
           case "$TARGET_REPO" in
-            Galass_Driver|Galass_Rider|Galass_backend) ;;
+            Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) ;;
             *) echo "::error::target_repo invalide : push refusé"; exit 1 ;;
           esac
           [ "$TARGET_GIT" = "https://github.com/LordThiouk/${TARGET_REPO}.git" ] \
@@ -975,6 +1024,55 @@ jobs:
           echo "log_branch=$logp" >> "$GITHUB_OUTPUT"
           [ "$work" = 1 ] || exit 1
 
+      - name: Contrôles et push des dépôts supplémentaires (jamais main, jamais force)
+        id: extra_push
+        if: always() && steps.extra.outcome == 'success' && steps.prep.outcome == 'success'
+        env:
+          PUSH_TOKEN: ${{ secrets.GALASS_TOKEN }}
+          IN_BRANCH: ${{ inputs.branch }}
+          ISA_STAMP_KEY: ${{ secrets.ISA_STAMP_KEY }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+        run: |
+          set +x
+          export PATH=/usr/bin:/bin
+          if [ -z "${EXTRA_REPOS:-}" ]; then
+            echo "Aucun dépôt supplémentaire"
+            exit 0
+          fi
+          [[ "$IN_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || { echo "::error::branche invalide : push des dépôts supplémentaires refusé"; exit 1; }
+          case "${IN_BRANCH,,}" in
+            main|master|head|refs/*|*..*|*/|*.lock|fullrun-logs/*|fullrun-prompts|fullrun-prompts/*) echo "::error::branche interdite : push des dépôts supplémentaires refusé"; exit 1 ;;
+          esac
+          T=/opt/fullrun-tools
+          if [ ! -f "$T/extra-repos.sh" ] || [ ! -f "$T/gitleaks" ]; then
+            echo "::error::outil figé absent : push des dépôts supplémentaires refusé"
+            exit 1
+          fi
+          K="$RUNNER_TEMP/extra-isa.key"
+          ( umask 077; printf '%s' "${ISA_STAMP_KEY:-}" > "$K" )
+          trap 'rm -f "$K"' EXIT
+          if ! EXTRA_TOKEN_STDIN=0 EXTRA_GITLEAKS="$T/gitleaks" EXTRA_ISA_KEY_FILE="$K" \
+               EXTRA_STATE="${EXTRA_STATE:-$RUNNER_TEMP/extra-state}" EXTRA_WORK="$RUNNER_TEMP/extra-scan" \
+               IN_BRANCH="$IN_BRANCH" EXTRA_ROOT="$EXTRA_ROOT" EXTRA_REPOS="$EXTRA_REPOS" \
+               TARGET_REPO="$TARGET_REPO" "$T/extra-repos.sh" check; then
+            echo "::error::contrôles des dépôts supplémentaires refusés : aucun de ces dépôts n'est poussé"
+            exit 1
+          fi
+          [ -n "${PUSH_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
+          if ! printf '%s\n' "$PUSH_TOKEN" | EXTRA_TOKEN_STDIN=1 EXTRA_GITLEAKS="$T/gitleaks" \
+               EXTRA_ISA_KEY_FILE="$K" EXTRA_STATE="${EXTRA_STATE:-$RUNNER_TEMP/extra-state}" \
+               EXTRA_WORK="$RUNNER_TEMP/extra-push" IN_BRANCH="$IN_BRANCH" EXTRA_ROOT="$EXTRA_ROOT" \
+               EXTRA_REPOS="$EXTRA_REPOS" TARGET_REPO="$TARGET_REPO" "$T/extra-repos.sh" push; then
+            echo "::error::push des dépôts supplémentaires refusé (rien n'a été forcé)"
+            exit 1
+          fi
+
       # PR en brouillon, jamais fusionnée : seulement quand le run s'est arrêté « terminé » et que
       # le validateur de fin (Max PASS) est vert. Aucune autre opération gh que la création.
       - name: PR en brouillon (jamais fusionnée)
@@ -992,7 +1090,7 @@ jobs:
           set +x
           export PATH=/usr/local/bin:/usr/bin:/bin
           case "$TARGET_REPO" in
-            Galass_Driver|Galass_Rider|Galass_backend) ;;
+            Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) ;;
             *) echo "::warning::target_repo invalide : pas de PR"; exit 0 ;;
           esac
           command -v gh >/dev/null 2>&1 || { echo "::warning::gh absent : pas de PR"; exit 0; }
@@ -1016,6 +1114,37 @@ jobs:
           [ -n "$url" ] || { echo "::warning::création de la PR impossible"; exit 0; }
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "- PR en brouillon : $url" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: PR en brouillon des dépôts supplémentaires (jamais fusionnées)
+        id: extra_pr
+        if: always() && steps.extra_push.outcome == 'success' && steps.oc.outputs.stop == 'ok' && steps.check.outputs.done == 'ok'
+        continue-on-error: true
+        env:
+          PUSH_TOKEN: ${{ secrets.GALASS_TOKEN }}
+          IN_BRANCH: ${{ inputs.branch }}
+          IN_BASE: ${{ inputs.base_branch }}
+          IN_JOB: ${{ inputs.job_name }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +x
+          export PATH=/usr/local/bin:/usr/bin:/bin
+          if [ -z "${EXTRA_REPOS:-}" ]; then
+            echo "Aucun dépôt supplémentaire"
+            exit 0
+          fi
+          T=/opt/fullrun-tools
+          [ -f "$T/extra-repos.sh" ] || { echo "::warning::outil figé absent : pas de PR supplémentaires"; exit 0; }
+          [ -n "${PUSH_TOKEN:-}" ] || { echo "::warning::GALASS_TOKEN absent : pas de PR supplémentaires"; exit 0; }
+          printf '%s\n' "$PUSH_TOKEN" | EXTRA_TOKEN_STDIN=1 \
+            EXTRA_STATE="${EXTRA_STATE:-$RUNNER_TEMP/extra-state}" \
+            IN_BRANCH="$IN_BRANCH" IN_BASE="$IN_BASE" IN_JOB="$IN_JOB" \
+            EXTRA_ROOT="$EXTRA_ROOT" EXTRA_REPOS="$EXTRA_REPOS" TARGET_REPO="$TARGET_REPO" \
+            "$T/extra-repos.sh" pr | tee "$RUNNER_TEMP/extra-pr.out"
+          if grep -q 'PR en brouillon :' "$RUNNER_TEMP/extra-pr.out"; then
+            echo "- PR supplémentaires en brouillon :" >> "$GITHUB_STEP_SUMMARY"
+            grep 'PR en brouillon :' "$RUNNER_TEMP/extra-pr.out" | sed 's/^/  /' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Statut final
         if: always()

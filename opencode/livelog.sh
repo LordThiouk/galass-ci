@@ -19,7 +19,7 @@ if [ -n "${LIVE_REMOTE:-}" ]; then
   REMOTE="$LIVE_REMOTE"
 elif [ -n "${TARGET_REPO:-}" ]; then
   case "$TARGET_REPO" in
-    Galass_Driver|Galass_Rider|Galass_backend)
+    Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub)
       REMOTE="https://github.com/LordThiouk/${TARGET_REPO}.git" ;;
     *) echo "TARGET_REPO invalide" >&2; exit 2 ;;
   esac

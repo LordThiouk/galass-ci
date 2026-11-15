@@ -156,6 +156,18 @@ for b in main master refs/heads/x fullrun-logs/test; do
 done
 ok "branches main/master/refs/fullrun-logs refusées à l'entrée"
 
+# --- 8b. TARGET_REPO : galass-emu-actions-pub accepté, lifeos refusé ----------
+env -u WIP_REMOTE TARGET_REPO=lifeos WIP_STATE="$tmp/state-x" \
+  "$here/wippush.sh" once > "$out" 2>&1 && ko "lifeos accepté comme TARGET_REPO"
+grep -q 'TARGET_REPO invalide' "$out" || ko "refus lifeos non signalé : $(cat "$out")"
+printf 'emu\n' > "$work/e.txt"; git -C "$work" add e.txt; git -C "$work" commit -qm "wip: e"
+printf '%s\n' "$fake_token" | PATH="$shim:$PATH" WIP_TOKEN_STDIN=1 WIP_STATE="$tmp/state-emu" \
+  env -u WIP_REMOTE TARGET_REPO=galass-emu-actions-pub \
+  "$here/wippush.sh" once > "$out" 2>&1
+grep -q 'wip poussé' "$out" || ko "galass-emu-actions-pub refusé comme TARGET_REPO : $(cat "$out")"
+grep -q 'https://github.com/LordThiouk/galass-emu-actions-pub.git' "$tmp/push.argv" || ko "URL emu inattendue"
+ok "TARGET_REPO : galass-emu-actions-pub accepté, lifeos refusé"
+
 # --- 9. le jeton n'apparaît nulle part -------------------------------------------------------
 grep -rqaF -- "$fake_token" "$tmp/state" "$tmp/state-h" "$tmp/state2" "$dout" "$out" "$remote" "$remote2" \
   && ko "jeton retrouvé dans la sortie, l'état ou un dépôt"

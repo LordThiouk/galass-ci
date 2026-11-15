@@ -5,6 +5,10 @@ Tu tournes sur un runner GitHub Actions public, pas sur la box. Suis le FullRun.
 - Dépôt de travail : le répertoire courant (`$TARGET_DIR`), checkout de `LordThiouk/$TARGET_REPO`
   sur la branche `$OC_BRANCH`. Les chemins `/home/box/...` et `/workspace/...` du prompt
   désignent ici `$HOME/...` et ce checkout (`/home/box` est un lien vers `$HOME`).
+- Dépôts supplémentaires : s'il y en a (`$EXTRA_REPOS`, vide si aucun), chacun est dans
+  `$EXTRA_ROOT/<nom>` (ex. `$EXTRA_ROOT/galass-emu-actions-pub`). Tu peux y lire et y
+  commiter, sur `$OC_BRANCH` uniquement. Tu ne pousses rien. Le journal `fullrun-logs`
+  reste dans le dépôt cible (`$TARGET_REPO`).
 - **Tu ne pousses rien.** Pas de `git push`, pas de `gh`, pas de PR, pas de commentaire : tu n'as
   aucun jeton d'écriture. Fais des commits locaux sur `$OC_BRANCH` uniquement (jamais de
   `git reset --hard`, `rebase`, `commit --amend` sur des commits déjà présents au départ :
