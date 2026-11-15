@@ -10,7 +10,7 @@
 #   emu-e2e.sh prompt-block   bloc à ajouter au prompt (aucun secret)
 #   emu-e2e.sh append-prompt  ajoute le bloc à $OC_WORK/prompt.md
 #
-# Ne relâche aucune garde FullRun. Modèles Artemis : uniquement *-free (jamais FreeLLM).
+# Ne relâche aucune garde FullRun. Modèle dispatché : opencode/*-free (jamais FreeLLM, jamais de clé API).
 set -euo pipefail
 set +x
 
@@ -23,7 +23,7 @@ EMU_REPO="${EMU_OWNER}/${EMU_REPO_NAME}"
 EMU_WORKFLOW="artemis-staging-e2e.yml"
 RIDER_REPO="Galass_Rider"
 DRIVER_REPO="Galass_Driver"
-DEFAULT_MODEL="deepseek-v4.1-flash-free"
+DEFAULT_MODEL="opencode/deepseek-v4.1-flash-free"
 DEFAULT_TIMEOUT_SEC=10800
 DEFAULT_POLL_SEC=30
 DEFAULT_LOG_TAIL=80
@@ -101,12 +101,28 @@ load_config() {
   [ -n "$OC_BRANCH" ] || fail "branche de travail manquante (OC_BRANCH)"
 }
 
-validate_model() {
+normalize_model() {
   local m="$1"
-  [[ "$m" =~ ^[a-z0-9][a-z0-9.-]*-free$ ]] || fail "modèle Artemis refusé (uniquement id *-free) : $m"
+  m="${m#"${m%%[![:space:]]*}"}"
+  m="${m%"${m##*[![:space:]]}"}"
   case "$m" in
-    *freellm*|*FreeLLM*|opencode/*|*/*) fail "modèle Artemis refusé (pas de FreeLLM, pas de préfixe) : $m" ;;
+    opencode/*) printf '%s\n' "$m" ;;
+    *) printf 'opencode/%s\n' "$m" ;;
   esac
+}
+
+validate_model() {
+  local raw="$1" m
+  [ -n "$raw" ] || fail "modèle refusé (uniquement opencode/*-free)"
+  case "$raw" in
+    *freellm*|*FreeLLM*|*[Ff]ree[Ll][Ll][Mm]*)
+      fail "modèle refusé (pas de FreeLLM) : $raw"
+      ;;
+  esac
+  m=$(normalize_model "$raw")
+  [[ "$m" =~ ^opencode/[a-z0-9][a-z0-9.-]*-free$ ]] \
+    || fail "modèle refusé (uniquement opencode/*-free) : $raw"
+  printf '%s\n' "$m"
 }
 
 gh_bin() {
@@ -179,9 +195,10 @@ la commande en boucle.
   sur le dépôt, sinon \`main\`. Tu ne choisis pas ces refs toi-même.
 - Si le script retombe sur \`main\`, la branche de travail n'est pas encore sur GitHub :
   attends le push wip, puis relance.
-- Modèle Artemis : uniquement un id \`*-free\` (défaut \`deepseek-v4.1-flash-free\`).
-  Pas de FreeLLM, pas d'appel HTTP direct à un modèle. Les modèles FullRun restent
-  \`opencode/*-free\`.
+- Modèle côté emu : uniquement \`opencode/*-free\` (défaut
+  \`opencode/deepseek-v4.1-flash-free\`). Le CLI opencode (pas une clé API)
+  pilote les émulateurs sur le dépôt emu. Pas de FreeLLM, pas d'appel HTTP
+  direct à un modèle. Les modèles FullRun restent \`opencode/*-free\`.
 - Tu n'as aucun jeton : n'utilise pas \`gh\` toi-même, n'invente pas de secret,
   n'écris aucun secret. Passe seulement par le script figé ci-dessus
   (pas une copie dans le workspace).
@@ -259,7 +276,7 @@ view_run() {
 run_e2e() {
   local since run_id deadline status conclusion url view s_status s_conclusion s_url
   load_config
-  validate_model "$EMU_E2E_MODEL"
+  EMU_E2E_MODEL=$(validate_model "$EMU_E2E_MODEL")
   if [ "${GITHUB_ACTIONS:-}" != "true" ] && [ -z "${EMU_E2E_GH:-}" ]; then
     fail "refus : lancer seulement depuis le FullRun (ou un test avec EMU_E2E_GH)"
   fi

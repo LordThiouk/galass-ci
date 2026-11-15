@@ -30,7 +30,7 @@ printf '%s' "$blk" | grep -q '/opt/fullrun-tools/emu-e2e.sh' || ko "prompt sans 
 printf '%s' "$blk" | grep -q 'artemis-staging-e2e.yml' || ko "prompt sans le workflow emu"
 printf '%s' "$blk" | grep -q 'galass-emu-actions-pub' || ko "prompt sans le dépôt emu"
 printf '%s' "$blk" | grep -qi 'pas de FreeLLM' || ko "prompt doit interdire FreeLLM"
-printf '%s' "$blk" | grep -q 'deepseek-v4.1-flash-free' || ko "prompt sans le modèle *-free par défaut"
+printf '%s' "$blk" | grep -q 'opencode/deepseek-v4.1-flash-free' || ko "prompt sans le modèle opencode/*-free par défaut"
 printf '%s' "$blk" | grep -q 'opencode/\*-free' || ko "prompt doit rappeler les modèles opencode/*-free"
 printf '%s' "$blk" | grep -qE 'https?://opencode.ai|OPENAI_API_KEY|OPENAI_BASE_URL|FREELLMAPI|GALASS_STAGING_URL|GALASS_E2E_|DEBUG_KEYSTORE' \
   && ko "prompt ne doit pas contenir d'URL d'API modèle ni de nom de secret e2e"
@@ -122,13 +122,17 @@ printf '%s\n' "$refs" | grep -q 'Galass_Driver' || ko "resolve-refs doit signale
 printf '%s\n' "$refs" | grep -Fq "$tok" && ko "jeton fuité dans resolve-refs"
 ok "resolve-refs : branche de travail ou main, sans fuite"
 
-# Modèle non *-free refusé (avant tout appel réseau).
+# Modèle non opencode/*-free refusé (avant tout appel réseau).
 if out=$(EMU_E2E_MODEL=gemini-2.5-flash "$sh" run 2>&1); then
   ko "un modèle non *-free aurait dû être refusé"
 fi
 printf '%s' "$out" | grep -qi 'refusé' || ko "le refus de modèle doit être explicite"
 printf '%s' "$out" | grep -Fq "$tok" && ko "jeton fuité lors du refus de modèle"
-# Défaut : le run (échec simulé) doit envoyer deepseek-v4.1-flash-free.
+if out=$(EMU_E2E_MODEL=freellm/foo-free "$sh" run 2>&1); then
+  ko "FreeLLM aurait dû être refusé"
+fi
+printf '%s' "$out" | grep -qi 'refusé' || ko "le refus FreeLLM doit être explicite"
+# Défaut : le run (échec simulé) doit envoyer opencode/deepseek-v4.1-flash-free.
 unset EMU_E2E_MODEL || true
 : > "$tmp/gh.log.dispatch"
 set +e
@@ -145,8 +149,8 @@ n=$(printf '%s\n' "$out" | grep -c 'fail line' || true)
 printf '%s' "$out" | grep -Fq "$tok" && ko "jeton fuité dans l'extrait de logs"
 printf '%s' "$out" | grep -q 'fail line 195' || ko "l'extrait devrait garder la fin du journal"
 printf '%s' "$out" | grep -q 'token=\*\*\*' || ko "le jeton dans l'extrait doit être masqué"
-grep -q 'model=deepseek-v4.1-flash-free' "$tmp/gh.log.dispatch" \
-  || ko "le déclenchement doit passer model=deepseek-v4.1-flash-free"
+grep -q 'model=opencode/deepseek-v4.1-flash-free' "$tmp/gh.log.dispatch" \
+  || ko "le déclenchement doit passer model=opencode/deepseek-v4.1-flash-free"
 grep -q 'rider_ref=feat/multi' "$tmp/gh.log.dispatch" || ko "dispatch sans rider_ref de travail"
 grep -q 'driver_ref=main' "$tmp/gh.log.dispatch" || ko "dispatch sans driver_ref=main"
 ok "run : déclenchement *-free, verdict et extrait court, pas de fuite"
