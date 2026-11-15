@@ -15,15 +15,15 @@
 # $WIP_STATE/status pour l'étape de contrôle.
 set +x
 set -uo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=opencode/allowed-repos.sh
+. "$here/allowed-repos.sh"
 : "${WIP_STATE:?}" "${WIP_REPO:?}" "${WIP_BRANCH:?}" "${WIP_JOB:?}" "${WIP_RUN:?}"
 if [ -n "${WIP_REMOTE:-}" ]; then
   REMOTE="$WIP_REMOTE"
 elif [ -n "${TARGET_REPO:-}" ]; then
-  case "$TARGET_REPO" in
-    Galass_Driver|Galass_Rider|Galass_backend)
-      REMOTE="https://github.com/LordThiouk/${TARGET_REPO}.git" ;;
-    *) echo "TARGET_REPO invalide" >&2; exit 2 ;;
-  esac
+  allowed_repo "$TARGET_REPO" || { echo "TARGET_REPO invalide" >&2; exit 2; }
+  REMOTE="https://github.com/LordThiouk/${TARGET_REPO}.git"
 else
   echo "WIP_REMOTE ou TARGET_REPO requis" >&2
   exit 2

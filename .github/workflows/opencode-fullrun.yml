@@ -1,21 +1,28 @@
 name: opencode FullRun
 run-name: FullRun ${{ inputs.job_name }} → ${{ inputs.target_repo }}@${{ inputs.branch }}
 
-# Longs jobs opencode (FullRun LifeOS) pour un dépôt privé Galass
-# (Galass_Driver, Galass_Rider ou Galass_backend), choisi par l'entrée target_repo.
+# Longs jobs opencode (FullRun LifeOS) pour un dépôt Galass choisi par target_repo
+# (Galass_Driver, Galass_Rider, Galass_backend ou galass-emu-actions-pub).
+# Des dépôts supplémentaires optionnels (extra_repos) sont récupérés à côté, même branche.
 # Dépôt PUBLIC : logs visibles par tous. La sortie d'opencode reste dans un fichier du
 # runner, jamais affichée ni publiée en artifact. Déclenchement manuel uniquement.
 on:
   workflow_dispatch:
     inputs:
       target_repo:
-        description: "Dépôt Galass privé cible (Driver, Rider ou backend)"
+        description: "Dépôt Galass cible (Driver, Rider, backend ou tests e2e)"
         required: true
         type: choice
         options:
           - Galass_Driver
           - Galass_Rider
           - Galass_backend
+          - galass-emu-actions-pub
+      extra_repos:
+        description: "Dépôts supplémentaires, séparés par des virgules, parmi Galass_Driver, Galass_Rider, Galass_backend, galass-emu-actions-pub (vide = aucun). Même branche de fonctionnalité. Le journal fullrun-logs reste dans target_repo."
+        required: false
+        type: string
+        default: ""
       branch:
         description: "Branche de fonctionnalité du dépôt cible, déjà poussée (jamais main/master)"
         required: true
@@ -108,6 +115,8 @@ jobs:
       TARGET_REPO: ${{ inputs.target_repo }}
       TARGET_DIR: ${{ github.workspace }}/target
       TARGET_GIT: https://github.com/LordThiouk/${{ inputs.target_repo }}.git
+      IN_EXTRA: ${{ inputs.extra_repos }}
+      EXTRA_ROOT: ${{ github.workspace }}/extra
       CI_DIR: ${{ github.workspace }}/ci
       OPENCODE_DISABLE_AUTOUPDATE: "1"
     steps:
@@ -122,10 +131,8 @@ jobs:
           esac
           [[ "$IN_JOB" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail "job_name invalide"
           [[ "$IN_PROMPT" =~ ^(prompts|repo|ci):[A-Za-z0-9._/-]+$ && "$IN_PROMPT" != *..* ]] || fail "prompt_path invalide (prompts:<chemin>, repo:<chemin> ou ci:<chemin>)"
-          case "$TARGET_REPO" in
-            Galass_Driver|Galass_Rider|Galass_backend) ;;
-            *) fail "target_repo invalide (Galass_Driver, Galass_Rider ou Galass_backend)" ;;
-          esac
+          # target_repo et extra_repos : validés après le checkout de galass-ci,
+          # via extra-repos.sh parse (liste blanche unique dans allowed-repos.sh).
           [[ "$IN_LIFEOS_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ && "$IN_LIFEOS_REF" != *..* ]] || fail "lifeos_ref invalide"
           if [ -n "$OC_ISA_PATH" ]; then
             [[ "$OC_ISA_PATH" =~ ^MEMORY/WORK/[A-Za-z0-9._-]+/ISA\.md$ && "$OC_ISA_PATH" != *..* ]] \
@@ -173,6 +180,18 @@ jobs:
           path: ci
           persist-credentials: false
 
+      - name: Valider target_repo et extra_repos (liste blanche unique)
+        run: |
+          set +x
+          fail() { echo "::error::$1"; exit 1; }
+          [ -f "$CI_DIR/opencode/extra-repos.sh" ] || fail "extra-repos.sh absent : impossible de valider extra_repos"
+          if ! extras=$(EXTRA_REPOS_RAW="${IN_EXTRA:-}" TARGET_REPO="$TARGET_REPO"                  "$CI_DIR/opencode/extra-repos.sh" parse 2>"$RUNNER_TEMP/extra-parse.err"); then
+            err=$(tr -d '\r' < "$RUNNER_TEMP/extra-parse.err" | head -n1)
+            fail "${err:-extra_repos invalide}"
+          fi
+          echo "EXTRA_REPOS=$extras" >> "$GITHUB_ENV"
+          if [ -n "$extras" ]; then echo "Dépôts supplémentaires : $extras"; else echo "Aucun dépôt supplémentaire"; fi
+
       - name: Checkout du dépôt cible (lecture seule)
         uses: actions/checkout@v4
         with:
@@ -182,6 +201,27 @@ jobs:
           path: target
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Checkout des dépôts supplémentaires
+        id: extra
+        env:
+          GALASS_TOKEN: ${{ secrets.GALASS_TOKEN }}
+        run: |
+          set +x
+          if [ -z "${EXTRA_REPOS:-}" ]; then
+            echo "Aucun dépôt supplémentaire"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ -n "${GALASS_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/extra-state"
+          echo "EXTRA_STATE=$RUNNER_TEMP/extra-state" >> "$GITHUB_ENV"
+          printf '%s\n' "$GALASS_TOKEN" | EXTRA_TOKEN_STDIN=1 EXTRA_STATE="$RUNNER_TEMP/extra-state" \
+            IN_BRANCH="$IN_BRANCH" EXTRA_ROOT="$EXTRA_ROOT" EXTRA_REPOS="$EXTRA_REPOS" \
+            TARGET_REPO="$TARGET_REPO" "$CI_DIR/opencode/extra-repos.sh" checkout
+          n=0; IFS=',' read -r -a _ers <<<"$EXTRA_REPOS"; n="${#_ers[@]}"
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "Dépôts supplémentaires ($n) dans $EXTRA_ROOT/<nom>"
 
       - name: Checkout LifeOS (lecture seule)
         uses: actions/checkout@v4
@@ -339,14 +379,15 @@ jobs:
           git update-ref -d refs/remotes/origin/fullrun-prompts 2>/dev/null || true
           export OC_BRANCH="$IN_BRANCH" OC_JOB="$IN_JOB" OC_REPORT="$OC_WORK/REPORT.md"
           # shellcheck disable=SC2016 # liste de variables pour envsubst, pas une expansion
-          envsubst '$TARGET_DIR $TARGET_REPO $OC_BRANCH $OC_REPORT $OC_JOB $OC_MODEL_MAIN $OC_MODEL_MAX' \
+          envsubst '$TARGET_DIR $TARGET_REPO $OC_BRANCH $OC_REPORT $OC_JOB $OC_MODEL_MAIN $OC_MODEL_MAX $EXTRA_ROOT $EXTRA_REPOS' \
             < "$CI_DIR/opencode/ci-preamble.md" > "$OC_WORK/prompt.md"
           cat "$p" >> "$OC_WORK/prompt.md"
           echo "Prompt prêt ($(wc -l < "$OC_WORK/prompt.md") lignes), base $(git rev-parse --short HEAD)"
 
 
-      # Avant opencode : gitleaks (épinglé, sha256 vérifié), les scripts de masquage, de chiffrement
-      # et du journal en direct, et le destinataire age sont copiés en root dans /opt/fullrun-tools.
+      # Avant opencode : gitleaks (épinglé, sha256 vérifié), les scripts de masquage, de chiffrement,
+      # du journal en direct, des dépôts supplémentaires, et le destinataire age sont copiés en root
+      # dans /opt/fullrun-tools.
       # opencode ne peut plus les modifier (sans sudo) : les contrôles et l'artefact publié après le
       # run s'appuient sur ces copies, pas sur $CI_DIR (modifiable par opencode).
       - name: Outils de contrôle figés (root, avant opencode)
@@ -363,7 +404,8 @@ jobs:
           sudo install -d -o root -g root -m 0755 "$T" "$L"
           sudo install -o root -g root -m 0755 "$RUNNER_TEMP/gl/gitleaks" "$CI_DIR/opencode/redact-log.sh" \
             "$CI_DIR/opencode/leaklog.sh" "$CI_DIR/opencode/livelog.sh" "$CI_DIR/opencode/progress.sh" \
-            "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" "$T/"
+            "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" \
+            "$CI_DIR/opencode/extra-repos.sh" "$T/"
           sudo install -o root -g root -m 0644 "$CI_DIR/opencode/log-recipient.txt" "$T/"
           rm -rf "$RUNNER_TEMP/gl" "$f"
           # Config gitleaks du dépôt cible au SHA de départ (même règle que le contrôle avant push).
@@ -440,29 +482,82 @@ jobs:
           [[ "$IN_JOB" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$RUN_ID" =~ ^[0-9]{1,20}$ ]] \
             || { echo "::warning::job ou run invalide : pas de push périodique"; exit 0; }
           [[ "$IN_WIP_PUSH_MIN" =~ ^[0-9]{1,3}$ ]] || { echo "::warning::wip_push_minutes invalide : pas de push périodique"; exit 0; }
-          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::warning::BASE_SHA absent : pas de push périodique"; exit 0; }
           [ -n "${PUSH_TOKEN:-}" ] || { echo "::warning::GALASS_TOKEN absent : pas de push périodique"; exit 0; }
           gcfg=""; [ -f "$T/gitleaks.toml" ] && gcfg="$T/gitleaks.toml"
-          sudo -n install -d -o root -g root -m 0755 "$L" \
-            || { echo "::warning::dossier d'état root inaccessible : pas de push périodique"; exit 0; }
-          # shellcheck disable=SC2024 # sortie d'état du démon dans un fichier du runner : voulu
-          printf '%s\n' "$PUSH_TOKEN" | sudo -n env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$L" \
-            WIP_STATE="$L" WIP_REPO="$TARGET_DIR" WIP_BRANCH="$IN_BRANCH" WIP_JOB="$IN_JOB" WIP_RUN="$RUN_ID" \
-            WIP_REMOTE="$TARGET_GIT" \
-            WIP_BASE_SHA="$BASE_SHA" WIP_GITLEAKS="$T/gitleaks" WIP_GL_CONFIG="$gcfg" \
-            WIP_GL_IGNORE="$T/gitleaks-ignore" WIP_ISA_KEY_FILE=/opt/fullrun-live/isa.key WIP_TOKEN_STDIN=1 \
-            IN_WIP_PUSH_MIN="$IN_WIP_PUSH_MIN" \
-            setsid -f nice -n 0 "$T/wippush.sh" daemon > "$RUNNER_TEMP/wip.out" 2>&1 &
-          ok=0
-          for _ in 1 2 3 4 5 6 7 8 9 10; do
-            pid=$(sudo -n cat "$L/pid" 2>/dev/null || true)
-            if [[ "$pid" =~ ^[0-9]{1,9}$ ]] && sudo -n kill -0 "$pid" 2>/dev/null; then ok=1; break; fi
-            sleep 1
-          done
-          [ "$ok" = 1 ] || { echo "::warning::démon de push périodique non démarré : le run continue sans"; exit 0; }
-          echo -500 | sudo -n tee "/proc/$pid/oom_score_adj" >/dev/null 2>&1 || true
-          echo "- Push des wip : branche \`$IN_BRANCH\` toutes les ${IN_WIP_PUSH_MIN} min (gitleaks + clé ISA avant chaque envoi)" >> "$GITHUB_STEP_SUMMARY"
-          echo "Push périodique des wip démarré (toutes les ${IN_WIP_PUSH_MIN} min)"
+          # Démon du dépôt cible : un échec ici ne doit pas empêcher le wip des dépôts extra.
+          if ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::BASE_SHA absent : pas de push périodique du dépôt cible"
+          elif ! sudo -n install -d -o root -g root -m 0755 "$L"; then
+            echo "::warning::dossier d'état root inaccessible : pas de push périodique du dépôt cible"
+          else
+            # shellcheck disable=SC2024 # sortie d'état du démon dans un fichier du runner : voulu
+            printf '%s\n' "$PUSH_TOKEN" | sudo -n env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$L" \
+              WIP_STATE="$L" WIP_REPO="$TARGET_DIR" WIP_BRANCH="$IN_BRANCH" WIP_JOB="$IN_JOB" WIP_RUN="$RUN_ID" \
+              WIP_REMOTE="$TARGET_GIT" \
+              WIP_BASE_SHA="$BASE_SHA" WIP_GITLEAKS="$T/gitleaks" WIP_GL_CONFIG="$gcfg" \
+              WIP_GL_IGNORE="$T/gitleaks-ignore" WIP_ISA_KEY_FILE=/opt/fullrun-live/isa.key WIP_TOKEN_STDIN=1 \
+              IN_WIP_PUSH_MIN="$IN_WIP_PUSH_MIN" \
+              setsid -f nice -n 0 "$T/wippush.sh" daemon > "$RUNNER_TEMP/wip.out" 2>&1 &
+            ok=0
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              pid=$(sudo -n cat "$L/pid" 2>/dev/null || true)
+              if [[ "$pid" =~ ^[0-9]{1,9}$ ]] && sudo -n kill -0 "$pid" 2>/dev/null; then ok=1; break; fi
+              sleep 1
+            done
+            if [ "$ok" = 1 ]; then
+              echo -500 | sudo -n tee "/proc/$pid/oom_score_adj" >/dev/null 2>&1 || true
+              echo "- Push des wip : branche \`$IN_BRANCH\` toutes les ${IN_WIP_PUSH_MIN} min (gitleaks + clé ISA avant chaque envoi)" >> "$GITHUB_STEP_SUMMARY"
+              echo "Push périodique des wip démarré (toutes les ${IN_WIP_PUSH_MIN} min)"
+            else
+              echo "::warning::démon de push périodique non démarré : le run continue sans (les extra seront tentés s'il y en a)"
+            fi
+          fi
+          # Dépôts supplémentaires : un démon wippush par dépôt, même cadence, mêmes garde-fous
+          # (gitleaks, clé ISA, jamais main, jamais --force). Le jeton arrive sur stdin.
+          if [ -n "${EXTRA_REPOS:-}" ] && [ -n "${EXTRA_STATE:-}" ]; then
+            sudo -n install -d -o root -g root -m 0755 /opt/fullrun-wip-extra \
+              || { echo "::warning::dossier wip extra inaccessible : pas de push périodique des extra"; exit 0; }
+            IFS=',' read -r -a _ers <<<"$EXTRA_REPOS"
+            for r in "${_ers[@]}"; do
+              r="${r//[[:space:]]/}"
+              [ -n "$r" ] || continue
+              # Noms déjà filtrés par parse ; garde de chemin seulement (pas de seconde liste blanche).
+              [[ "$r" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$ ]] || continue
+              if [ ! -d "$EXTRA_ROOT/$r/.git" ]; then
+                echo "::warning::$r : checkout absent, pas de push périodique"
+                continue
+              fi
+              b=$(tr -dc '0-9a-f' < "$EXTRA_STATE/$r.base" 2>/dev/null || true)
+              if ! [[ "$b" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::warning::$r : SHA de départ absent, pas de push périodique"
+                continue
+              fi
+              Lx="/opt/fullrun-wip-extra/$r"
+              sudo -n install -d -o root -g root -m 0755 "$Lx" || continue
+              # shellcheck disable=SC2024
+              printf '%s\n' "$PUSH_TOKEN" | sudo -n env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$Lx" \
+                WIP_STATE="$Lx" WIP_REPO="$EXTRA_ROOT/$r" WIP_BRANCH="$IN_BRANCH" \
+                WIP_JOB="$IN_JOB" WIP_RUN="$RUN_ID" \
+                WIP_REMOTE="https://github.com/LordThiouk/${r}.git" \
+                WIP_BASE_SHA="$b" WIP_GITLEAKS="$T/gitleaks" WIP_GL_CONFIG="$gcfg" \
+                WIP_GL_IGNORE="$T/gitleaks-ignore" WIP_ISA_KEY_FILE=/opt/fullrun-live/isa.key \
+                WIP_TOKEN_STDIN=1 IN_WIP_PUSH_MIN="$IN_WIP_PUSH_MIN" \
+                setsid -f nice -n 0 "$T/wippush.sh" daemon > "$RUNNER_TEMP/wip-extra-$r.out" 2>&1 &
+              okx=0
+              for _ in 1 2 3 4 5 6 7 8 9 10; do
+                pid=$(sudo -n cat "$Lx/pid" 2>/dev/null || true)
+                if [[ "$pid" =~ ^[0-9]{1,9}$ ]] && sudo -n kill -0 "$pid" 2>/dev/null; then okx=1; break; fi
+                sleep 1
+              done
+              if [ "$okx" = 1 ]; then
+                echo -500 | sudo -n tee "/proc/$pid/oom_score_adj" >/dev/null 2>&1 || true
+                echo "- Push des wip ($r) : branche \`$IN_BRANCH\` toutes les ${IN_WIP_PUSH_MIN} min" >> "$GITHUB_STEP_SUMMARY"
+                echo "Push périodique des wip démarré pour $r (toutes les ${IN_WIP_PUSH_MIN} min)"
+              else
+                echo "::warning::démon de push périodique non démarré pour $r : le run continue sans"
+              fi
+            done
+          fi
 
       # Priorité mémoire (best-effort, jamais fatal) : si le runner sature, opencode meurt le
       # premier ; Runner.Worker et les superviseurs des démons restent pour écrire le rapport.
@@ -473,7 +568,8 @@ jobs:
           for p in $(pgrep -f '[R]unner.Worker' 2>/dev/null || true); do
             echo -500 | sudo -n tee "/proc/$p/oom_score_adj" >/dev/null 2>&1 || true
           done
-          for f in /opt/fullrun-live/pid /opt/fullrun-wip/pid; do
+          for f in /opt/fullrun-live/pid /opt/fullrun-wip/pid /opt/fullrun-wip-extra/*/pid; do
+            [ -e "$f" ] || continue
             p=$(sudo -n cat "$f" 2>/dev/null || true)
             if [[ "$p" =~ ^[0-9]{1,9}$ ]]; then
               echo -500 | sudo -n tee "/proc/$p/oom_score_adj" >/dev/null 2>&1 || true
@@ -622,8 +718,8 @@ jobs:
             st=$(sudo -n cat "$L/status" 2>/dev/null || true)
             echo "- Journal en direct : $(grep -c 'envoyé (clair)' <<<"$st") instantané(s) en clair, $(grep -c 'envoyé (chiffré)' <<<"$st") chiffré(s), $(grep -c 'envoi impossible\|non envoyé\|échec' <<<"$st") échec(s)" >> "$GITHUB_STEP_SUMMARY"
           fi
-          # Push périodique des wip : démon arrêté (il finit le passage en cours), puis reprise du
-          # dernier SHA poussé : base du scan final, et pas de double push.
+          # Push périodique des wip : démons arrêtés (ils finissent le passage en cours), puis
+          # reprise du dernier SHA poussé : base du scan final, et pas de double push.
           wip_tip=""; wpush=0
           if pid=$(sudo -n cat /opt/fullrun-wip/pid 2>/dev/null) && [[ "$pid" =~ ^[0-9]{1,9}$ ]]; then
             sudo -n kill -TERM "$pid" 2>/dev/null || true
@@ -639,6 +735,29 @@ jobs:
             grep -E '^\[suivi\] wip (poussé|non poussé|démarré|arrêté)' <<<"$wst" | tail -n 40 || true
             echo "- Push des wip : ${wpush} push(s) pendant le run$([ -n "$wip_tip" ] && echo ", dernier SHA ${wip_tip:0:7}")" >> "$GITHUB_STEP_SUMMARY"
           fi
+          # Démons wip des dépôts supplémentaires : TERM à tous d'abord, puis attente, puis KILL.
+          extra_pids=""
+          for pf in /opt/fullrun-wip-extra/*/pid; do
+            [ -e "$pf" ] || continue
+            pid=$(sudo -n cat "$pf" 2>/dev/null || true)
+            if [[ "$pid" =~ ^[0-9]{1,9}$ ]]; then
+              sudo -n kill -TERM "$pid" 2>/dev/null || true
+              extra_pids="$extra_pids $pid"
+            fi
+          done
+          for pid in $extra_pids; do
+            for _ in $(seq 1 75); do sudo -n kill -0 "$pid" 2>/dev/null || break; sleep 2; done
+            sudo -n kill -KILL "$pid" 2>/dev/null || true
+          done
+          for pf in /opt/fullrun-wip-extra/*/pid; do
+            [ -e "$pf" ] || continue
+            wst=$(sudo -n cat "$(dirname "$pf")/status" 2>/dev/null || true)
+            wpush_x=$(grep -c 'wip poussé' <<<"$wst" || true)
+            rname=$(basename "$(dirname "$pf")")
+            [[ "$rname" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$ ]] || continue
+            grep -E '^\[suivi\] wip (poussé|non poussé|démarré|arrêté)' <<<"$wst" | tail -n 40 || true
+            echo "- Push des wip ($rname) : ${wpush_x} push(s) pendant le run" >> "$GITHUB_STEP_SUMMARY"
+          done
           # Clé ISA prise du secret (pas du fichier de $HOME, modifiable par l'IA).
           K="$OC_WORK/isa-check.key"; ( umask 077; printf '%s' "${ISA_STAMP_KEY:-}" > "$K" )
           trap 'rm -f "$K" "$OC_WORK/run.diff" "$OC_WORK/log.redacted" "$OC_WORK/log.index"' EXIT
@@ -924,10 +1043,9 @@ jobs:
           LOGB="fullrun-logs/${IN_JOB}-${RUN_ID}"
           [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA contrôlé absent : push refusé"; exit 1; }
           [ -n "${PUSH_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
-          case "$TARGET_REPO" in
-            Galass_Driver|Galass_Rider|Galass_backend) ;;
-            *) echo "::error::target_repo invalide : push refusé"; exit 1 ;;
-          esac
+          # shellcheck source=opencode/allowed-repos.sh
+          . "$CI_DIR/opencode/allowed-repos.sh"
+          allowed_repo "$TARGET_REPO" || { echo "::error::target_repo invalide : push refusé"; exit 1; }
           [ "$TARGET_GIT" = "https://github.com/LordThiouk/${TARGET_REPO}.git" ] \
             || { echo "::error::TARGET_GIT invalide : push refusé"; exit 1; }
           # Push depuis un dépôt nu neuf : ni .git/config ni ~/.gitconfig (écrits par l'IA) ne s'appliquent.
@@ -975,6 +1093,55 @@ jobs:
           echo "log_branch=$logp" >> "$GITHUB_OUTPUT"
           [ "$work" = 1 ] || exit 1
 
+      - name: Contrôles et push des dépôts supplémentaires (jamais main, jamais force)
+        id: extra_push
+        if: always() && steps.extra.outcome == 'success' && steps.prep.outcome == 'success'
+        env:
+          PUSH_TOKEN: ${{ secrets.GALASS_TOKEN }}
+          IN_BRANCH: ${{ inputs.branch }}
+          ISA_STAMP_KEY: ${{ secrets.ISA_STAMP_KEY }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+        run: |
+          set +x
+          export PATH=/usr/bin:/bin
+          if [ -z "${EXTRA_REPOS:-}" ]; then
+            echo "Aucun dépôt supplémentaire"
+            exit 0
+          fi
+          [[ "$IN_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || { echo "::error::branche invalide : push des dépôts supplémentaires refusé"; exit 1; }
+          case "${IN_BRANCH,,}" in
+            main|master|head|refs/*|*..*|*/|*.lock|fullrun-logs/*|fullrun-prompts|fullrun-prompts/*) echo "::error::branche interdite : push des dépôts supplémentaires refusé"; exit 1 ;;
+          esac
+          T=/opt/fullrun-tools
+          if [ ! -f "$T/extra-repos.sh" ] || [ ! -f "$T/gitleaks" ]; then
+            echo "::error::outil figé absent : push des dépôts supplémentaires refusé"
+            exit 1
+          fi
+          K="$RUNNER_TEMP/extra-isa.key"
+          ( umask 077; printf '%s' "${ISA_STAMP_KEY:-}" > "$K" )
+          trap 'rm -f "$K"' EXIT
+          if ! EXTRA_TOKEN_STDIN=0 EXTRA_GITLEAKS="$T/gitleaks" EXTRA_ISA_KEY_FILE="$K" \
+               EXTRA_STATE="${EXTRA_STATE:-$RUNNER_TEMP/extra-state}" EXTRA_WORK="$RUNNER_TEMP/extra-scan" \
+               IN_BRANCH="$IN_BRANCH" EXTRA_ROOT="$EXTRA_ROOT" EXTRA_REPOS="$EXTRA_REPOS" \
+               TARGET_REPO="$TARGET_REPO" "$T/extra-repos.sh" check; then
+            echo "::error::contrôles des dépôts supplémentaires refusés : aucun de ces dépôts n'est poussé"
+            exit 1
+          fi
+          [ -n "${PUSH_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
+          if ! printf '%s\n' "$PUSH_TOKEN" | EXTRA_TOKEN_STDIN=1 EXTRA_GITLEAKS="$T/gitleaks" \
+               EXTRA_ISA_KEY_FILE="$K" EXTRA_STATE="${EXTRA_STATE:-$RUNNER_TEMP/extra-state}" \
+               EXTRA_WORK="$RUNNER_TEMP/extra-push" IN_BRANCH="$IN_BRANCH" EXTRA_ROOT="$EXTRA_ROOT" \
+               EXTRA_REPOS="$EXTRA_REPOS" TARGET_REPO="$TARGET_REPO" "$T/extra-repos.sh" push; then
+            echo "::error::push des dépôts supplémentaires refusé (rien n'a été forcé)"
+            exit 1
+          fi
+
       # PR en brouillon, jamais fusionnée : seulement quand le run s'est arrêté « terminé » et que
       # le validateur de fin (Max PASS) est vert. Aucune autre opération gh que la création.
       - name: PR en brouillon (jamais fusionnée)
@@ -991,10 +1158,9 @@ jobs:
         run: |
           set +x
           export PATH=/usr/local/bin:/usr/bin:/bin
-          case "$TARGET_REPO" in
-            Galass_Driver|Galass_Rider|Galass_backend) ;;
-            *) echo "::warning::target_repo invalide : pas de PR"; exit 0 ;;
-          esac
+          # shellcheck source=opencode/allowed-repos.sh
+          . "$CI_DIR/opencode/allowed-repos.sh"
+          allowed_repo "$TARGET_REPO" || { echo "::warning::target_repo invalide : pas de PR"; exit 0; }
           command -v gh >/dev/null 2>&1 || { echo "::warning::gh absent : pas de PR"; exit 0; }
           [ -n "${PUSH_TOKEN:-}" ] || { echo "::warning::GALASS_TOKEN absent : pas de PR"; exit 0; }
           base="$IN_BASE"
@@ -1016,6 +1182,37 @@ jobs:
           [ -n "$url" ] || { echo "::warning::création de la PR impossible"; exit 0; }
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "- PR en brouillon : $url" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: PR en brouillon des dépôts supplémentaires (jamais fusionnées)
+        id: extra_pr
+        if: always() && steps.extra_push.outcome == 'success' && steps.oc.outputs.stop == 'ok' && steps.check.outputs.done == 'ok'
+        continue-on-error: true
+        env:
+          PUSH_TOKEN: ${{ secrets.GALASS_TOKEN }}
+          IN_BRANCH: ${{ inputs.branch }}
+          IN_BASE: ${{ inputs.base_branch }}
+          IN_JOB: ${{ inputs.job_name }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +x
+          export PATH=/usr/local/bin:/usr/bin:/bin
+          if [ -z "${EXTRA_REPOS:-}" ]; then
+            echo "Aucun dépôt supplémentaire"
+            exit 0
+          fi
+          T=/opt/fullrun-tools
+          [ -f "$T/extra-repos.sh" ] || { echo "::warning::outil figé absent : pas de PR supplémentaires"; exit 0; }
+          [ -n "${PUSH_TOKEN:-}" ] || { echo "::warning::GALASS_TOKEN absent : pas de PR supplémentaires"; exit 0; }
+          printf '%s\n' "$PUSH_TOKEN" | EXTRA_TOKEN_STDIN=1 \
+            EXTRA_STATE="${EXTRA_STATE:-$RUNNER_TEMP/extra-state}" \
+            IN_BRANCH="$IN_BRANCH" IN_BASE="$IN_BASE" IN_JOB="$IN_JOB" \
+            EXTRA_ROOT="$EXTRA_ROOT" EXTRA_REPOS="$EXTRA_REPOS" TARGET_REPO="$TARGET_REPO" \
+            "$T/extra-repos.sh" pr | tee "$RUNNER_TEMP/extra-pr.out"
+          if grep -q 'PR en brouillon :' "$RUNNER_TEMP/extra-pr.out"; then
+            echo "- PR supplémentaires en brouillon :" >> "$GITHUB_STEP_SUMMARY"
+            grep 'PR en brouillon :' "$RUNNER_TEMP/extra-pr.out" | sed 's/^/  /' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Statut final
         if: always()

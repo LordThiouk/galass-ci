@@ -121,6 +121,18 @@ want="http.https://github.com/.extraheader AUTHORIZATION: basic $(printf 'x-acce
 rm -f "$tmp/push.argv" "$tmp/push.hdr"
 ok "remote https : jeton passé à git par son environnement seul (ni argument, ni URL)"
 
+# --- 5c. TARGET_REPO : galass-emu-actions-pub accepté, lifeos refusé ----------
+printf 'journal emu\n' > "$LIVE_LOG"
+env -u LIVE_REMOTE TARGET_REPO=lifeos LIVE_STATE="$tmp/state-x" LIVE_TOKEN_STDIN=1 \
+  "$here/livelog.sh" snapshot > "$out" 2>&1 && ko "lifeos accepté comme TARGET_REPO"
+grep -q 'TARGET_REPO invalide' "$out" || ko "refus lifeos non signalé : $(cat "$out")"
+printf '%s\n' "$fake_token" | PATH="$shim:$PATH" LIVE_STATE="$tmp/state-emu" LIVE_RUN=46 \
+  env -u LIVE_REMOTE TARGET_REPO=galass-emu-actions-pub LIVE_TOKEN_STDIN=1 \
+  "$here/livelog.sh" snapshot > "$out" 2>&1
+grep -q 'envoyé (clair)' "$out" || ko "galass-emu-actions-pub refusé comme TARGET_REPO : $(cat "$out")"
+grep -q 'https://github.com/LordThiouk/galass-emu-actions-pub.git' "$tmp/push.argv" || ko "URL emu inattendue"
+ok "TARGET_REPO : galass-emu-actions-pub accepté, lifeos refusé"
+
 # --- 6. le jeton n'apparaît nulle part -------------------------------------------------------
 grep -rqaF -- "$fake_token" "$tmp/state" "$tmp/state2" "$tmp/state4" "$tmp/daemon.out" "$out" "$remote" && ko "jeton retrouvé dans la sortie ou l'état"
 ok "jeton absent des sorties, de l'état et du dépôt"
