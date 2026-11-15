@@ -1,0 +1,1159 @@
+name: opencode FullRun
+run-name: FullRun ${{ inputs.job_name }} → ${{ inputs.target_repo }}@${{ inputs.branch }}
+
+# Longs jobs opencode (FullRun LifeOS) pour un dépôt privé Galass
+# (Galass_Driver, Galass_Rider ou Galass_backend), choisi par l'entrée target_repo.
+# Dépôt PUBLIC : logs visibles par tous. La sortie d'opencode reste dans un fichier du
+# runner, jamais affichée ni publiée en artifact. Déclenchement manuel uniquement.
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Dépôt Galass privé cible (Driver, Rider ou backend)"
+        required: true
+        type: choice
+        options:
+          - Galass_Driver
+          - Galass_Rider
+          - Galass_backend
+      branch:
+        description: "Branche de fonctionnalité du dépôt cible, déjà poussée (jamais main/master)"
+        required: true
+        type: string
+      prompt_path:
+        description: "Prompt : prompts:<chemin sur la branche fullrun-prompts du dépôt cible> (recommandé), repo:<chemin> ou ci:<chemin>"
+        required: true
+        type: string
+      job_name:
+        description: "Nom du job (lettres, chiffres, - _ .) ; rapport .fullrun/<job>_DONE.md"
+        required: true
+        type: string
+      model_main:
+        description: "Modèle principal et Forge (gratuit opencode uniquement)"
+        type: string
+        default: opencode/deepseek-v4.1-flash-free
+      model_max:
+        description: "Modèle de Max (gratuit opencode uniquement)"
+        type: string
+        default: opencode/mimo-v2.6-flash-free
+      model_fallback:
+        description: "Repli (compat) quand model_chain est vide : un seul modèle de secours"
+        type: string
+        default: opencode/glm-5.3-flash-free
+      model_chain:
+        description: "Chaîne de secours ordonnée (gratuits opencode/*-free, séparés par des virgules ; le principal est retiré)"
+        type: string
+        default: opencode/glm-5.3-flash-free,opencode/minimax-m3.1-flash-free,opencode/mimo-v2.6-flash-free,opencode/longcat-2.5-free,opencode/iceman-free,opencode/flint-40b-free,opencode/nemotron-3.5-lightning-free,opencode/beam-free,opencode/inkling-2-small-free
+      lifeos_ref:
+        description: "Branche de LordThiouk/lifeos (skills, agents, config opencode privée)"
+        type: string
+        default: main
+      isa_path:
+        description: "ISA suivie (MEMORY/WORK/<dossier>/ISA.md) ; vide = déduite du prompt"
+        type: string
+        default: ""
+      base_branch:
+        description: "Branche cible de la PR en brouillon (vide = branche par défaut du dépôt cible)"
+        type: string
+        default: ""
+      idle_minutes:
+        description: "Agent figé : si le journal opencode n'écrit plus rien pendant N min (10 à 120), coupe et reprend la session (3 reprises max)"
+        type: string
+        default: "20"
+      wip_push_minutes:
+        description: "Push des commits wip de la branche toutes les N min pendant le run (5 à 120)"
+        type: string
+        default: "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencode-fullrun-${{ inputs.target_repo }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+env:
+  OPENCODE_VERSION: "1.19.4"
+  BUN_VERSION: "1.4.4"
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  RIPGREP_VERSION: "14.1.1"
+  RIPGREP_SHA256: "4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e"
+  RTK_VERSION: "1.2.0"
+  RTK_SHA256: "70fee7b4a548c43dde94c77e2335550981b0bc2fb013691d8c8109b5bd0eda37"
+  AGE_VERSION: "1.2.1"
+  AGE_SHA256: "7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50"
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  fullrun:
+    if: github.actor == 'LordThiouk' && github.triggering_actor == 'LordThiouk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      IN_BRANCH: ${{ inputs.branch }}
+      IN_PROMPT: ${{ inputs.prompt_path }}
+      IN_JOB: ${{ inputs.job_name }}
+      OC_MODEL_MAIN: ${{ inputs.model_main }}
+      OC_MODEL_MAX: ${{ inputs.model_max }}
+      OC_MODEL_FALLBACK: ${{ inputs.model_fallback }}
+      OC_MODEL_CHAIN: ${{ inputs.model_chain }}
+      IN_LIFEOS_REF: ${{ inputs.lifeos_ref }}
+      OC_ISA_PATH: ${{ inputs.isa_path }}
+      IN_IDLE_MIN: ${{ inputs.idle_minutes }}
+      IN_WIP_PUSH_MIN: ${{ inputs.wip_push_minutes }}
+      TARGET_REPO: ${{ inputs.target_repo }}
+      TARGET_DIR: ${{ github.workspace }}/target
+      TARGET_GIT: https://github.com/LordThiouk/${{ inputs.target_repo }}.git
+      CI_DIR: ${{ github.workspace }}/ci
+      OPENCODE_DISABLE_AUTOUPDATE: "1"
+    steps:
+      - name: Garde des entrées (branche, modèles gratuits, chemins)
+        id: guard
+        run: |
+          set +x
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$IN_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || fail "branche invalide"
+          case "${IN_BRANCH,,}" in
+            main|master|head|refs/*|*..*|*/|*.lock|fullrun-logs/*|fullrun-prompts|fullrun-prompts/*) fail "branche interdite : seule une branche de fonctionnalité est acceptée" ;;
+          esac
+          [[ "$IN_JOB" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail "job_name invalide"
+          [[ "$IN_PROMPT" =~ ^(prompts|repo|ci):[A-Za-z0-9._/-]+$ && "$IN_PROMPT" != *..* ]] || fail "prompt_path invalide (prompts:<chemin>, repo:<chemin> ou ci:<chemin>)"
+          case "$TARGET_REPO" in
+            Galass_Driver|Galass_Rider|Galass_backend) ;;
+            *) fail "target_repo invalide (Galass_Driver, Galass_Rider ou Galass_backend)" ;;
+          esac
+          [[ "$IN_LIFEOS_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ && "$IN_LIFEOS_REF" != *..* ]] || fail "lifeos_ref invalide"
+          if [ -n "$OC_ISA_PATH" ]; then
+            [[ "$OC_ISA_PATH" =~ ^MEMORY/WORK/[A-Za-z0-9._-]+/ISA\.md$ && "$OC_ISA_PATH" != *..* ]] \
+              || fail "isa_path invalide (MEMORY/WORK/<dossier>/ISA.md)"
+          fi
+          if ! [[ "$IN_IDLE_MIN" =~ ^[0-9]{2,3}$ ]] || [ "$((10#$IN_IDLE_MIN))" -lt 10 ] || [ "$((10#$IN_IDLE_MIN))" -gt 120 ]; then
+            fail "idle_minutes invalide (entier de 10 à 120)"
+          fi
+          if ! [[ "$IN_WIP_PUSH_MIN" =~ ^[0-9]{1,3}$ ]] || [ "$((10#$IN_WIP_PUSH_MIN))" -lt 5 ] || [ "$((10#$IN_WIP_PUSH_MIN))" -gt 120 ]; then
+            fail "wip_push_minutes invalide (entier de 5 à 120)"
+          fi
+          for m in "$OC_MODEL_MAIN" "$OC_MODEL_MAX" "$OC_MODEL_FALLBACK"; do
+            [[ "$m" =~ ^opencode/[a-z0-9.-]+-free$ ]] || fail "modèle refusé : seuls les modèles opencode/*-free sont admis"
+          done
+          # Chaîne de secours : model_chain, sinon model_fallback (compat). Chaque élément doit
+          # être gratuit et différent du principal ; la chaîne ne peut pas être vide.
+          chain="${OC_MODEL_CHAIN:-}"
+          [ -n "$chain" ] || chain="$OC_MODEL_FALLBACK"
+          n=0
+          IFS=',' read -r -a cms <<<"$chain"
+          for m in "${cms[@]}"; do
+            m="${m//[[:space:]]/}"
+            [ -n "$m" ] || continue
+            [[ "$m" =~ ^opencode/[a-z0-9.-]+-free$ ]] || fail "modèle de secours refusé : $m"
+            [ "$m" != "$OC_MODEL_MAIN" ] || fail "le secours doit différer du principal ($m)"
+            n=$((n + 1))
+          done
+          [ "$n" -ge 1 ] || fail "chaîne de secours vide"
+          echo "OC_MODEL_CHAIN=$chain" >> "$GITHUB_ENV"
+          echo "OC_WORK=$RUNNER_TEMP/oc" >> "$GITHUB_ENV"
+          # Début du job (pour le plafond d'opencode et la durée notifiée) : sortie de step, pas $GITHUB_ENV.
+          echo "t0=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "Entrées valides : branche $IN_BRANCH, job $IN_JOB, silence max $((10#$IN_IDLE_MIN)) min"
+
+      - name: Garde du secret GALASS_TOKEN
+        env:
+          GALASS_TOKEN: ${{ secrets.GALASS_TOKEN }}
+        run: |
+          set +x
+          [ -n "${GALASS_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
+
+      - name: Checkout galass-ci
+        uses: actions/checkout@v4
+        with:
+          path: ci
+          persist-credentials: false
+
+      - name: Checkout du dépôt cible (lecture seule)
+        uses: actions/checkout@v4
+        with:
+          repository: LordThiouk/${{ inputs.target_repo }}
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.GALASS_TOKEN }}
+          path: target
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout LifeOS (lecture seule)
+        uses: actions/checkout@v4
+        with:
+          repository: LordThiouk/lifeos
+          ref: ${{ inputs.lifeos_ref }}
+          token: ${{ secrets.LIFEOS_READ_TOKEN }}
+          path: lifeos
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Installer opencode (version de la box)
+        run: |
+          npm install -g --no-fund --no-audit "opencode-ai@${OPENCODE_VERSION}" >/dev/null 2>&1
+          v=$(opencode --version 2>/dev/null | tail -n1)
+          [ "$v" = "$OPENCODE_VERSION" ] || { echo "::error::opencode $v au lieu de $OPENCODE_VERSION"; exit 1; }
+          echo "opencode $v"
+
+      - name: Installer ripgrep (épinglé, sha256 vérifié)
+        run: |
+          f="$RUNNER_TEMP/rg.tgz"
+          curl -sSfL -o "$f" "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${RIPGREP_SHA256}  $f" | sha256sum -c --quiet
+          tar -xzf "$f" -C "$RUNNER_TEMP" "ripgrep-${RIPGREP_VERSION}-x86_64-unknown-linux-musl/rg"
+          sudo install -m 0755 "$RUNNER_TEMP/ripgrep-${RIPGREP_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rg --version | head -n1
+
+      # Le hook LifeOS ContextReduction réécrit git/gh en `rtk git ...` / `rtk gh ...`.
+      # Sans rtk sur le PATH, chaque commande git/gh du run finissait en exit 127.
+      - name: Installer rtk (épinglé, sha256 vérifié)
+        run: |
+          f="$RUNNER_TEMP/rtk.tgz"
+          curl -sSfL -o "$f" "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-x86_64-unknown-linux-musl.tar.gz"
+          echo "${RTK_SHA256}  $f" | sha256sum -c --quiet
+          tar -xzf "$f" -C "$RUNNER_TEMP" rtk
+          sudo install -m 0755 "$RUNNER_TEMP/rtk" /usr/local/bin/rtk
+          rtk --version
+
+      # Chiffrement du journal opencode quand les contrôles refusent le push : sans age, le
+      # journal disparaît avec le runner et personne ne sait ce que l'agent a fait.
+      - name: Installer age (épinglé, sha256 vérifié)
+        run: |
+          f="$RUNNER_TEMP/age.tgz"
+          curl -sSfL -o "$f" "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-linux-amd64.tar.gz"
+          echo "${AGE_SHA256}  $f" | sha256sum -c --quiet
+          tar -xzf "$f" -C "$RUNNER_TEMP" age/age age/age-keygen
+          sudo install -m 0755 "$RUNNER_TEMP/age/age" /usr/local/bin/age
+          sudo install -m 0755 "$RUNNER_TEMP/age/age-keygen" /usr/local/bin/age-keygen
+          age --version
+
+      - name: Reconstituer ~/.claude et ~/.config/opencode
+        run: |
+          set +x
+          L="$GITHUB_WORKSPACE/lifeos"
+          [ -d "$L/opencode/agent" ] || { echo "::error::lifeos@$IN_LIFEOS_REF sans dossier opencode/"; exit 1; }
+          mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode-lifeos" \
+                   "$HOME/.claude/LIFEOS/MEMORY/STATE"
+          rsync -a --exclude /.git --exclude /secrets --exclude /opencode "$L/" "$HOME/.claude/"
+          # Parité avec la box : ni `rtk hook claude` (rtk absent de la box, ContextReduction.hook.sh
+          # couvre déjà git/gh et reste inerte sans rtk) ni hooks http vers localhost:31337
+          # (service local absent ; le plugin les compterait en échec à chaque Skill/Agent).
+          jq '.hooks |= with_entries(.value |= (map(.hooks |= map(select(
+                ((.command // "") != "rtk hook claude")
+                and ((.type // "command") != "http" or ((.url // "") | test("^http://localhost:31337/") | not))
+              ))) | map(select((.hooks | length) > 0))))' \
+            "$L/settings.template.json" > "$HOME/.claude/settings.json"
+          [ "$(jq '[.hooks[][].hooks[] | select(.command == "rtk hook claude" or .type == "http")] | length' "$HOME/.claude/settings.json")" = 0 ] \
+            || { echo "::error::settings.json : filtrage rtk/http incomplet"; exit 1; }
+          (cd "$HOME/.claude" && bun install --silent >/dev/null 2>&1) || echo "::warning::bun install ~/.claude incomplet"
+          C="$HOME/.config/opencode"
+          cp "$CI_DIR/opencode/config/opencode.json" "$C/opencode.json"
+          cp -r "$L/opencode/agent" "$L/opencode/command" "$L/opencode/plugins" "$C/"
+          cp "$L/opencode/package.json" "$C/package.json"
+          cp "$L/opencode/nix-lifeos.prompt.md" "$HOME/.local/share/opencode-lifeos/"
+          # Le socle LifeOS n'est plus une `instructions` globale (chargée par CHAQUE sous-agent) :
+          # il est concaténé au prompt de Nix, dans le même ordre que l'ancienne liste. Un fichier
+          # manquant n'empêche pas le run mais le signale. Taille avant : 91 222 caractères par
+          # agent ; après : 0 pour les sous-agents, ~91 500 pour Nix seul.
+          P="$HOME/.local/share/opencode-lifeos/nix-lifeos.prompt.md"
+          for rel in \
+            LIFEOS/LIFEOS_SYSTEM_PROMPT.md \
+            LIFEOS/DOCUMENTATION/ARCHITECTURE_SUMMARY.md \
+            LIFEOS/USER/TELOS/PRINCIPAL_TELOS.md \
+            LIFEOS/USER/PRINCIPAL/PRINCIPAL_IDENTITY.md \
+            LIFEOS/USER/DIGITAL_ASSISTANT/DA_IDENTITY.md \
+            LIFEOS/USER/PROJECTS.md \
+            LIFEOS/USER/CONFIG/OPERATIONAL_RULES.md \
+            LIFEOS/ALGORITHM/v8.20.2.md; do
+            if [ -f "$HOME/.claude/$rel" ]; then
+              printf '\n\n# %s\n\n' "${rel##*/}" >>"$P"
+              cat "$HOME/.claude/$rel" >>"$P"
+            else
+              echo "::warning::socle LifeOS manquant : $rel"
+            fi
+          done
+          [ -s "$P" ] || { echo "::error::prompt Nix vide"; exit 1; }
+          (cd "$C" && bun install --silent >/dev/null 2>&1) || { echo "::error::bun install ~/.config/opencode KO"; exit 1; }
+          # Modèles : Max sur model_max, tous les autres agents sur model_main.
+          for f in "$C"/agent/*.md; do
+            m="$OC_MODEL_MAIN"; [ "$(basename "$f")" = "Max.md" ] && m="$OC_MODEL_MAX"
+            sed -i -E "0,/^model: .*/s##model: ${m}#" "$f"
+          done
+          # Les agents générés citent /home/box : lien vers le HOME du runner.
+          [ -e /home/box ] || sudo ln -s "$HOME" /home/box
+          echo "Config LifeOS/opencode en place"
+
+      - name: Clé d'empreinte ISA
+        env:
+          ISA_STAMP_KEY: ${{ secrets.ISA_STAMP_KEY }}
+        run: |
+          set +x
+          [ -n "${ISA_STAMP_KEY:-}" ] || { echo "::error::secret ISA_STAMP_KEY absent (acte Papa requis)"; exit 1; }
+          echo "::add-mask::$ISA_STAMP_KEY"
+          K="$HOME/.claude/LIFEOS/MEMORY/STATE/.isa-stamp-key"
+          ( umask 077; printf '%s' "$ISA_STAMP_KEY" > "$K" )
+          [ "$(tr -d '\n' < "$K" | wc -c)" -ge 64 ] || { echo "::error::ISA_STAMP_KEY trop courte (64 hex attendus)"; exit 1; }
+          echo "Clé ISA écrite (0600)"
+
+      - name: Préparer le dépôt cible et le prompt
+        id: prep
+        run: |
+          set +x
+          cd "$TARGET_DIR"
+          # shellcheck disable=SC2153 # IN_BRANCH vient de l'env du job
+          [ "$(git rev-parse --abbrev-ref HEAD)" = "$IN_BRANCH" ] || git checkout -q -B "$IN_BRANCH" "origin/$IN_BRANCH"
+          git config user.name "Nix"
+          git config user.email "nix@galass.local"
+          # Aucun remote utilisable par l'IA : le push final ajoute ses propres identifiants.
+          printf '#!/bin/sh\necho "push interdit pendant le run opencode" >&2\nexit 1\n' > .git/hooks/pre-push
+          chmod +x .git/hooks/pre-push
+          mkdir -p "$OC_WORK"
+          # SHA de départ en sortie de step : opencode peut écrire dans $GITHUB_ENV, pas ici.
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          src="${IN_PROMPT%%:*}"; rel="${IN_PROMPT#*:}"
+          if [ "$src" = prompts ]; then
+            # Prompts hors branche de travail : branche fullrun-prompts du dépôt cible, jamais fusionnée.
+            p="$RUNNER_TEMP/prompt-src.md"
+            git cat-file -e "origin/fullrun-prompts:$rel" 2>/dev/null || { echo "::error::prompt introuvable sur fullrun-prompts"; exit 1; }
+            git show "origin/fullrun-prompts:$rel" > "$p"
+          else
+            if [ "$src" = repo ]; then root="$TARGET_DIR"; else root="$CI_DIR"; fi
+            p=$(realpath -e "$root/$rel" 2>/dev/null) || { echo "::error::prompt introuvable"; exit 1; }
+            case "$p" in "$root"/*) ;; *) echo "::error::prompt hors du dépôt"; exit 1 ;; esac
+          fi
+          # L'IA n'a pas à lire les prompts des autres jobs : on retire la référence locale.
+          git update-ref -d refs/remotes/origin/fullrun-prompts 2>/dev/null || true
+          export OC_BRANCH="$IN_BRANCH" OC_JOB="$IN_JOB" OC_REPORT="$OC_WORK/REPORT.md"
+          # shellcheck disable=SC2016 # liste de variables pour envsubst, pas une expansion
+          envsubst '$TARGET_DIR $TARGET_REPO $OC_BRANCH $OC_REPORT $OC_JOB $OC_MODEL_MAIN $OC_MODEL_MAX' \
+            < "$CI_DIR/opencode/ci-preamble.md" > "$OC_WORK/prompt.md"
+          cat "$p" >> "$OC_WORK/prompt.md"
+          echo "Prompt prêt ($(wc -l < "$OC_WORK/prompt.md") lignes), base $(git rev-parse --short HEAD)"
+
+
+      # Avant opencode : gitleaks (épinglé, sha256 vérifié), les scripts de masquage, de chiffrement
+      # et du journal en direct, et le destinataire age sont copiés en root dans /opt/fullrun-tools.
+      # opencode ne peut plus les modifier (sans sudo) : les contrôles et l'artefact publié après le
+      # run s'appuient sur ces copies, pas sur $CI_DIR (modifiable par opencode).
+      - name: Outils de contrôle figés (root, avant opencode)
+        env:
+          ISA_STAMP_KEY: ${{ secrets.ISA_STAMP_KEY }}
+          BASE_SHA: ${{ steps.prep.outputs.base }}
+        run: |
+          set +x
+          T=/opt/fullrun-tools; L=/opt/fullrun-live
+          f="$RUNNER_TEMP/gitleaks.tgz"
+          curl -sSfL -o "$f" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $f" | sha256sum -c --quiet
+          mkdir -p "$RUNNER_TEMP/gl" && tar -xzf "$f" -C "$RUNNER_TEMP/gl" gitleaks
+          sudo install -d -o root -g root -m 0755 "$T" "$L"
+          sudo install -o root -g root -m 0755 "$RUNNER_TEMP/gl/gitleaks" "$CI_DIR/opencode/redact-log.sh" \
+            "$CI_DIR/opencode/leaklog.sh" "$CI_DIR/opencode/livelog.sh" "$CI_DIR/opencode/progress.sh" \
+            "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" "$T/"
+          sudo install -o root -g root -m 0644 "$CI_DIR/opencode/log-recipient.txt" "$T/"
+          rm -rf "$RUNNER_TEMP/gl" "$f"
+          # Config gitleaks du dépôt cible au SHA de départ (même règle que le contrôle avant push).
+          cd "$TARGET_DIR"
+          if git cat-file -e "$BASE_SHA:.gitleaks.toml" 2>/dev/null; then
+            git show "$BASE_SHA:.gitleaks.toml" | sudo tee "$T/gitleaks.toml" >/dev/null
+            sudo chmod 0644 "$T/gitleaks.toml"
+          fi
+          # Ignore gitleaks du dépôt cible au SHA de départ (même règle pour le push périodique des wip).
+          sudo install -d -o root -g root -m 0755 "$T/gitleaks-ignore"
+          if git cat-file -e "$BASE_SHA:.gitleaksignore" 2>/dev/null; then
+            git show "$BASE_SHA:.gitleaksignore" | sudo tee "$T/gitleaks-ignore/.gitleaksignore" >/dev/null
+            sudo chmod 0644 "$T/gitleaks-ignore/.gitleaksignore"
+          fi
+          # Clé ISA pour le masquage du journal en direct : root, 0600.
+          printf '%s' "${ISA_STAMP_KEY:-}" | sudo sh -c 'umask 077; cat > /opt/fullrun-live/isa.key'
+          "$T/gitleaks" version
+          echo "Outils figés dans $T (root)"
+
+      # Journal en direct : un démon root pousse toutes les 10 min un instantané masqué du journal
+      # sur fullrun-logs/<job>-<run> du dépôt cible (privé) ; chiffré avec age si gitleaks y trouve encore
+      # un secret. Le jeton lui arrive sur stdin : il n'est ni dans l'environnement d'opencode, ni
+      # dans un fichier, ni dans une URL. Facultatif : un échec ici n'arrête jamais le run.
+      - name: Journal en direct (démon root, jeton hors d'opencode)
+        id: live
+        continue-on-error: true
+        env:
+          PUSH_TOKEN: ${{ secrets.GALASS_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          OC_LOG: ${{ runner.temp }}/oc/opencode.log
+        run: |
+          set +x
+          T=/opt/fullrun-tools; L=/opt/fullrun-live
+          [[ "$IN_JOB" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$RUN_ID" =~ ^[0-9]{1,20}$ ]] \
+            || { echo "::warning::job ou run invalide : pas de journal en direct"; exit 0; }
+          [ -n "${PUSH_TOKEN:-}" ] || { echo "::warning::GALASS_TOKEN absent : pas de journal en direct"; exit 0; }
+          LOGB="fullrun-logs/${IN_JOB}-${RUN_ID}"
+          gcfg=""; [ -f "$T/gitleaks.toml" ] && gcfg="$T/gitleaks.toml"
+          # shellcheck disable=SC2024 # sortie d'état du démon dans un fichier du runner : voulu
+          printf '%s\n' "$PUSH_TOKEN" | sudo -n env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$L" \
+            LIVE_STATE="$L" LIVE_LOG="$OC_LOG" LIVE_JOB="$IN_JOB" LIVE_RUN="$RUN_ID" \
+            LIVE_REMOTE="$TARGET_GIT" \
+            LIVE_GITLEAKS="$T/gitleaks" LIVE_GL_CONFIG="$gcfg" LIVE_ISA_KEY_FILE="$L/isa.key" \
+            LIVE_READ_UID="$(id -u)" LIVE_READ_GID="$(id -g)" LIVE_TOKEN_STDIN=1 \
+            setsid -f nice -n 0 "$T/livelog.sh" daemon > "$RUNNER_TEMP/live.out" 2>&1 &
+          ok=0
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            pid=$(sudo -n cat "$L/pid" 2>/dev/null || true)
+            if [[ "$pid" =~ ^[0-9]{1,9}$ ]] && sudo -n kill -0 "$pid" 2>/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { echo "::warning::démon du journal en direct non démarré : le run continue sans"; exit 0; }
+          # Le superviseur survit à une saturation mémoire : opencode et le runner passent avant lui.
+          echo -500 | sudo -n tee "/proc/$pid/oom_score_adj" >/dev/null 2>&1 || true
+          echo "branch=$LOGB" >> "$GITHUB_OUTPUT"
+          echo "- Journal en direct : branche \`$LOGB\` de $TARGET_REPO, instantané toutes les 10 min (chiffré si secret probable)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Journal en direct démarré → $TARGET_REPO@$LOGB"
+
+      # Push périodique des wip : un démon root pousse la branche de fonctionnalité toutes les
+      # IN_WIP_PUSH_MIN minutes, après gitleaks (copie figée) et le contrôle de clé ISA sur la
+      # plage dernier-poussé..HEAD. Un run annulé ou refusé par gitleaks ne perd plus ses commits.
+      # Le jeton lui arrive sur stdin : ni environnement d'opencode, ni fichier, ni URL.
+      - name: Push périodique des wip (démon root, jeton hors d'opencode)
+        id: wip
+        continue-on-error: true
+        env:
+          PUSH_TOKEN: ${{ secrets.GALASS_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          BASE_SHA: ${{ steps.prep.outputs.base }}
+          IN_WIP_PUSH_MIN: ${{ inputs.wip_push_minutes }}
+        run: |
+          set +x
+          T=/opt/fullrun-tools; L=/opt/fullrun-wip
+          [[ "$IN_JOB" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$RUN_ID" =~ ^[0-9]{1,20}$ ]] \
+            || { echo "::warning::job ou run invalide : pas de push périodique"; exit 0; }
+          [[ "$IN_WIP_PUSH_MIN" =~ ^[0-9]{1,3}$ ]] || { echo "::warning::wip_push_minutes invalide : pas de push périodique"; exit 0; }
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::warning::BASE_SHA absent : pas de push périodique"; exit 0; }
+          [ -n "${PUSH_TOKEN:-}" ] || { echo "::warning::GALASS_TOKEN absent : pas de push périodique"; exit 0; }
+          gcfg=""; [ -f "$T/gitleaks.toml" ] && gcfg="$T/gitleaks.toml"
+          sudo -n install -d -o root -g root -m 0755 "$L" \
+            || { echo "::warning::dossier d'état root inaccessible : pas de push périodique"; exit 0; }
+          # shellcheck disable=SC2024 # sortie d'état du démon dans un fichier du runner : voulu
+          printf '%s\n' "$PUSH_TOKEN" | sudo -n env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$L" \
+            WIP_STATE="$L" WIP_REPO="$TARGET_DIR" WIP_BRANCH="$IN_BRANCH" WIP_JOB="$IN_JOB" WIP_RUN="$RUN_ID" \
+            WIP_REMOTE="$TARGET_GIT" \
+            WIP_BASE_SHA="$BASE_SHA" WIP_GITLEAKS="$T/gitleaks" WIP_GL_CONFIG="$gcfg" \
+            WIP_GL_IGNORE="$T/gitleaks-ignore" WIP_ISA_KEY_FILE=/opt/fullrun-live/isa.key WIP_TOKEN_STDIN=1 \
+            IN_WIP_PUSH_MIN="$IN_WIP_PUSH_MIN" \
+            setsid -f nice -n 0 "$T/wippush.sh" daemon > "$RUNNER_TEMP/wip.out" 2>&1 &
+          ok=0
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            pid=$(sudo -n cat "$L/pid" 2>/dev/null || true)
+            if [[ "$pid" =~ ^[0-9]{1,9}$ ]] && sudo -n kill -0 "$pid" 2>/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { echo "::warning::démon de push périodique non démarré : le run continue sans"; exit 0; }
+          echo -500 | sudo -n tee "/proc/$pid/oom_score_adj" >/dev/null 2>&1 || true
+          echo "- Push des wip : branche \`$IN_BRANCH\` toutes les ${IN_WIP_PUSH_MIN} min (gitleaks + clé ISA avant chaque envoi)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Push périodique des wip démarré (toutes les ${IN_WIP_PUSH_MIN} min)"
+
+      # Priorité mémoire (best-effort, jamais fatal) : si le runner sature, opencode meurt le
+      # premier ; Runner.Worker et les superviseurs des démons restent pour écrire le rapport.
+      - name: Protection mémoire (OOM, best-effort)
+        continue-on-error: true
+        run: |
+          set +x
+          for p in $(pgrep -f '[R]unner.Worker' 2>/dev/null || true); do
+            echo -500 | sudo -n tee "/proc/$p/oom_score_adj" >/dev/null 2>&1 || true
+          done
+          for f in /opt/fullrun-live/pid /opt/fullrun-wip/pid; do
+            p=$(sudo -n cat "$f" 2>/dev/null || true)
+            if [[ "$p" =~ ^[0-9]{1,9}$ ]]; then
+              echo -500 | sudo -n tee "/proc/$p/oom_score_adj" >/dev/null 2>&1 || true
+            fi
+          done
+          echo "Priorité mémoire appliquée (best-effort)"
+
+      - name: opencode run (sortie jamais affichée, suivi filtré toutes les 10 min)
+        id: oc
+        continue-on-error: true
+        # Filet seulement : run-fullrun.sh arrête opencode avant (plafond du job - 15 min).
+        timeout-minutes: 340
+        env:
+          OC_JOB: ${{ inputs.job_name }}
+          OC_BRANCH: ${{ inputs.branch }}
+          OC_PROMPT_FILE: ${{ runner.temp }}/oc/prompt.md
+          OC_REPORT: ${{ runner.temp }}/oc/REPORT.md
+          OC_LOG: ${{ runner.temp }}/oc/opencode.log
+          OC_IDLE_MIN: ${{ inputs.idle_minutes }}
+          OC_JOB_T0: ${{ steps.guard.outputs.t0 }}
+          # Doit rester égal à timeout-minutes du job (350) ; marge de push : 15 min.
+          OC_JOB_TIMEOUT_MIN: "350"
+          OC_PUSH_MARGIN_MIN: "15"
+          OC_POLL_SEC: "30"
+          OC_KILL_GRACE: "60"
+          OC_PROGRESS_INTERVAL: "600"
+          OC_LIVE_BRANCH: ${{ steps.live.outputs.branch }}
+          BASE_SHA: ${{ steps.prep.outputs.base }}
+        run: |
+          set +x
+          # Suivi : lignes [suivi] à valeurs filtrées (liste blanche / nombres), jamais le log lui-même.
+          OC_START=$(date +%s); OC_PARENT_PID=$$; export OC_START OC_PARENT_PID
+          OC_IDLE_MIN=$((10#$OC_IDLE_MIN)); export OC_IDLE_MIN
+          unset OC_IDLE_SEC  # réservé aux tests locaux
+          t0="$OC_JOB_T0"; [[ "$t0" =~ ^[0-9]{9,11}$ && "$t0" -le "$OC_START" ]] || t0="$OC_START"
+          # opencode doit être arrêté (grâce SIGINT et dernier sondage compris) avant plafond - marge.
+          OC_DEADLINE_EPOCH=$(( t0 + (OC_JOB_TIMEOUT_MIN - OC_PUSH_MARGIN_MIN) * 60 - OC_KILL_GRACE - OC_POLL_SEC - 10 ))
+          export OC_DEADLINE_EPOCH
+          /opt/fullrun-tools/progress.sh start || true
+          /opt/fullrun-tools/progress.sh loop & mon=$!
+          # Plafond mémoire global d'opencode (best-effort) : sonde locale/CI avant usage. Le scope
+          # garde l'environnement du step (sinon repli direct) ; opencode meurt avant les démons.
+          scope=()
+          uid=$(id -u); gid=$(id -g)
+          # shellcheck disable=SC2016 # $OC_LOG est évalué par le shell interne de la sonde
+          probe=$(timeout 20 sudo -n -E systemd-run --scope --quiet -p MemoryMax=5G \
+            -- /usr/bin/setpriv --reuid="$uid" --regid="$gid" --init-groups -- \
+            /bin/sh -c 'echo "$(id -u):${OC_LOG:+set}"' 2>/dev/null || true)
+          if [ "$probe" = "$uid:set" ]; then
+            scope=(sudo -n -E systemd-run --scope --quiet -p MemoryMax=5G --
+                   /usr/bin/setpriv --reuid="$uid" --regid="$gid" --init-groups --)
+          else
+            echo "::warning::systemd-run --scope indisponible ou environnement non conservé : pas de plafond mémoire pour opencode"
+          fi
+          # opencode tourne dans sa propre session : une annulation (SIGINT/SIGTERM au step) est
+          # relayée au moniteur, qui l'arrête proprement avant les steps de rapport et de push.
+          "${scope[@]}" "$CI_DIR/opencode/run-fullrun.sh" & runner=$!
+          trap 'kill -TERM "$runner" 2>/dev/null || true' INT TERM
+          rc=0; wait "$runner" || rc=$?
+          if kill -0 "$runner" 2>/dev/null; then rc=0; wait "$runner" || rc=$?; fi
+          trap - INT TERM
+          kill "$mon" 2>/dev/null || true; wait "$mon" 2>/dev/null || true
+          # Raison décidée ici, d'après le code de sortie du moniteur (pas d'un fichier écrit par l'IA).
+          case "$rc" in
+            0) stop=ok; why="terminé" ;;
+            124) stop=plafond; why="plafond atteint" ;;
+            125) stop=silence; why="bloqué (silence ${OC_IDLE_MIN} min)" ;;
+            126) stop=vide; why="réponse vide (aucun token après reprises)" ;;
+            130) stop=annulation; why="annulé" ;;
+            *) stop=erreur; why="erreur opencode (code $rc)" ;;
+          esac
+          echo "stop=$stop" >> "$GITHUB_OUTPUT"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          /opt/fullrun-tools/progress.sh once fin "$stop" || true
+          echo "**Arrêt d'opencode : ${why}**" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -eq 0 ]; then
+            echo "opencode : terminé (code 0)"
+          else
+            echo "::error::opencode : ${why} ; le travail commité et le journal sont poussés sur la branche par les steps suivants"
+            exit 1
+          fi
+
+      - name: Rapport, journal privé et contrôles avant push
+        id: check
+        if: always() && steps.prep.outputs.base != ''
+        env:
+          OC_OUTCOME: ${{ steps.oc.outcome }}
+          OC_STOP: ${{ steps.oc.outputs.stop }}
+          OC_IDLE_MIN: ${{ inputs.idle_minutes }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Valeurs du step > $GITHUB_ENV : opencode ne peut ni changer la branche, ni la base,
+          # ni injecter BASH_ENV / LD_PRELOAD dans les steps de contrôle et de push.
+          IN_BRANCH: ${{ inputs.branch }}
+          IN_JOB: ${{ inputs.job_name }}
+          BASE_SHA: ${{ steps.prep.outputs.base }}
+          OC_WORK: ${{ runner.temp }}/oc
+          OC_INTERNAL_LOG: ${{ runner.temp }}/oc/opencode.log.internal
+          OC_REPORT: ${{ runner.temp }}/oc/REPORT.md
+          # Pas de OC_STORE_DIR / OC_HOOKS_LOG ici : le contexte `env` de GitHub Actions ne
+          # contient pas HOME (variable héritée du runner), donc `${{ env.HOME }}` rend une
+          # chaîne vide et le validateur cherchait `/.local/share/opencode` (raison a:none,
+          # run F4). done_check.sh retombe sur $HOME, posé par le shell du step.
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DIR: ${{ github.workspace }}/target
+          CI_DIR: ${{ github.workspace }}/ci
+          ISA_STAMP_KEY: ${{ secrets.ISA_STAMP_KEY }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+        run: |
+          set +x
+          # PATH fixe : $GITHUB_PATH (écrit par opencode) ne doit pas remplacer git, grep, curl…
+          export PATH=/usr/local/bin:/usr/bin:/bin
+          # Filet : un opencode encore vivant (step interrompu) ne doit plus écrire pendant les contrôles.
+          pkill -KILL -f '(^|[ /])opencode run ' 2>/dev/null || true
+          cd "$TARGET_DIR"
+          # Outils figés avant opencode (root) : gitleaks, masquage, chiffrement, destinataire age.
+          T=/opt/fullrun-tools; L=/opt/fullrun-live
+          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh log-recipient.txt; do
+            [ -f "$T/$tool" ] || { echo "::error::outil figé absent ($tool) : push refusé"; exit 1; }
+          done
+          # Artefact chiffré (journal + rapport gitleaks) : publié seulement si un contrôle refuse.
+          ART="$RUNNER_TEMP/fullrun-artifact"; rm -rf "$ART"; mkdir -p "$ART"
+          # Hooks et fsmonitor du dépôt neutralisés : l'IA a pu les écrire dans .git/config.
+          G=(git -c core.hooksPath=/dev/null -c core.fsmonitor=false)
+          mkdir -p "$OC_WORK"
+          # Fichiers de travail : jamais ceux qu'opencode aurait pu poser avant ce step.
+          rm -f "$OC_WORK/log.redacted" "$OC_WORK/gitleaks.json" "$OC_WORK/log.index" "$OC_WORK/run.diff"
+          # Journal en direct : démon arrêté (il finit l'instantané en cours) avant le journal de
+          # fin, qui se pose par-dessus son dernier commit (avance rapide, jamais de force).
+          live_tip=""; t=""
+          if pid=$(sudo -n cat "$L/pid" 2>/dev/null) && [[ "$pid" =~ ^[0-9]{1,9}$ ]]; then
+            sudo -n kill -TERM "$pid" 2>/dev/null || true
+            for _ in $(seq 1 75); do sudo -n kill -0 "$pid" 2>/dev/null || break; sleep 2; done
+            sudo -n kill -KILL "$pid" 2>/dev/null || true
+            t=$(sudo -n cat "$L/tip" 2>/dev/null | tr -dc '0-9a-f' || true)
+            if [[ "$t" =~ ^[0-9a-f]{40}$ ]] && [ -f "$L/live.bundle" ] \
+               && "${G[@]}" fetch -q --no-tags "$L/live.bundle" "+refs/heads/live:refs/fullrun-live/tip" >/dev/null 2>&1 \
+               && [ "$(git rev-parse -q --verify refs/fullrun-live/tip)" = "$t" ]; then
+              live_tip="$t"
+            fi
+            st=$(sudo -n cat "$L/status" 2>/dev/null || true)
+            echo "- Journal en direct : $(grep -c 'envoyé (clair)' <<<"$st") instantané(s) en clair, $(grep -c 'envoyé (chiffré)' <<<"$st") chiffré(s), $(grep -c 'envoi impossible\|non envoyé\|échec' <<<"$st") échec(s)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # Push périodique des wip : démon arrêté (il finit le passage en cours), puis reprise du
+          # dernier SHA poussé : base du scan final, et pas de double push.
+          wip_tip=""; wpush=0
+          if pid=$(sudo -n cat /opt/fullrun-wip/pid 2>/dev/null) && [[ "$pid" =~ ^[0-9]{1,9}$ ]]; then
+            sudo -n kill -TERM "$pid" 2>/dev/null || true
+            for _ in $(seq 1 75); do sudo -n kill -0 "$pid" 2>/dev/null || break; sleep 2; done
+            sudo -n kill -KILL "$pid" 2>/dev/null || true
+            t=$(sudo -n cat /opt/fullrun-wip/pushed 2>/dev/null | tr -dc '0-9a-f' || true)
+            if [[ "$t" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$t^{commit}" 2>/dev/null; then
+              wip_tip="$t"
+            fi
+            wst=$(sudo -n cat /opt/fullrun-wip/status 2>/dev/null || true)
+            wpush=$(grep -c 'wip poussé' <<<"$wst" || true)
+            # Lignes [suivi] du démon : texte fixe + SHA court + nom assaini, jamais un secret.
+            grep -E '^\[suivi\] wip (poussé|non poussé|démarré|arrêté)' <<<"$wst" | tail -n 40 || true
+            echo "- Push des wip : ${wpush} push(s) pendant le run$([ -n "$wip_tip" ] && echo ", dernier SHA ${wip_tip:0:7}")" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # Clé ISA prise du secret (pas du fichier de $HOME, modifiable par l'IA).
+          K="$OC_WORK/isa-check.key"; ( umask 077; printf '%s' "${ISA_STAMP_KEY:-}" > "$K" )
+          trap 'rm -f "$K" "$OC_WORK/run.diff" "$OC_WORK/log.redacted" "$OC_WORK/log.index"' EXIT
+          # Journal masqué puis chiffré pour le destinataire age public : sans ça, le runner
+          # effacé emporte la seule trace du run quand gitleaks refuse le push. Jamais fatal.
+          archive_log() {
+            local reason="$1" red="$OC_WORK/log.redacted" f
+            [ -s "$OC_WORK/opencode.log" ] || return 0
+            if [ ! -s "$red" ]; then
+              OC_ISA_KEY_FILE="$K" "$T/redact-log.sh" "$OC_WORK/opencode.log" "$red" || return 0
+            fi
+            if f=$("$T/leaklog.sh" "$red" "$OC_WORK/gitleaks.json" "$IN_JOB" "$RUN_ID" "$ART" \
+                     "$reason" "$RUN_URL" "$IN_BRANCH" "$BASE_SHA"); then
+              echo "artifact=$(basename "$f")" >> "$GITHUB_OUTPUT"
+              echo "- Journal chiffré en artefact \`$(basename "$f")\` (age, rétention 7 j, jamais en clair)" >> "$GITHUB_STEP_SUMMARY"
+              echo "Journal chiffré : $(basename "$f")"
+            else
+              echo "::warning::chiffrement du journal impossible : artifact non publié"
+            fi
+          }
+          # fail_check <code> <message> : refuse le push, chiffre le journal, sort en échec.
+          fail_check() {
+            echo "reason=$1" >> "$GITHUB_OUTPUT"
+            archive_log "$1"
+            echo "::error::$2"
+            exit 1
+          }
+          br=$(git rev-parse --abbrev-ref HEAD)
+          [ "$br" = "$IN_BRANCH" ] || fail_check branche "opencode a changé de branche : push refusé"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD || fail_check historique "historique réécrit depuis le SHA de départ : push refusé"
+          if git diff --name-only "$BASE_SHA" HEAD | grep -q '^\.github/workflows/'; then
+            fail_check workflows "modification de .github/workflows : push refusé"
+          fi
+          # Travail non commité : conservé dans un commit explicite pour la reprise.
+          if [ -n "$("${G[@]}" status --porcelain)" ]; then
+            "${G[@]}" add -A
+            "${G[@]}" commit -q -m "wip(ci): état non commité à la fin du run $IN_JOB" || true
+          fi
+          R=".fullrun/${IN_JOB}_DONE.md"
+          # Journal : JAMAIS sur la branche de travail ; commit orphelin sur une branche dédiée.
+          LOGB="fullrun-logs/${IN_JOB}-${RUN_ID}"
+          LOGREL=".fullrun/logs/${IN_JOB}-${RUN_ID}.log"
+          # Pas d'écriture à travers un lien symbolique posé par l'IA (ex. vers .git/config).
+          for p in .fullrun "$R"; do
+            [ ! -L "$p" ] || fail_check lien "lien symbolique inattendu dans .fullrun : push refusé"
+          done
+          mkdir -p .fullrun
+          # ISC pour la notification : nombres seulement, copie figée de progress.sh (pas celle de
+          # $CI_DIR, modifiable par opencode, alors que la clé ISA est déjà sur disque), sans la clé dans l'env.
+          isc=$(env -u ISA_STAMP_KEY OC_LOG="$OC_WORK/opencode.log" OC_START=0 OC_PROMPT_FILE="$OC_WORK/prompt.md" \
+                OC_ISA_PATH="${OC_ISA_PATH:-}" BASE_SHA="$BASE_SHA" "$T/progress.sh" isc 2>/dev/null | head -n1)
+          [[ "$isc" =~ ^([0-9]{1,7}|\?)/([0-9]{1,7}|\?)$ ]] || isc="?/?"
+          {
+            echo "# Run CI $IN_JOB"
+            echo
+            echo "- run : $RUN_URL"
+            echo "- fin : $(TZ=Africa/Dakar date '+%Y-%m-%d %H:%M') (Dakar)"
+            echo "- branche : $IN_BRANCH ; base \`$BASE_SHA\`"
+            echo "- push des wip : ${wpush} pendant le run${wip_tip:+ (dernier SHA ${wip_tip:0:7})}"
+            case "${OC_STOP:-}" in
+              ok) echo "- arrêt : terminé" ;;
+              silence) echo "- arrêt : bloqué (silence $((10#$OC_IDLE_MIN)) min), opencode arrêté par le garde-fou" ;;
+              plafond) echo "- arrêt : plafond atteint, opencode arrêté avant la limite du job" ;;
+              vide) echo "- arrêt : réponse vide (aucun token après reprises)" ;;
+              annulation) echo "- arrêt : run annulé" ;;
+              erreur) echo "- arrêt : erreur opencode" ;;
+              *) echo "- arrêt : inconnu (step opencode interrompu)" ;;
+            esac
+            echo "- opencode : $OC_OUTCOME ; $(tr '\n' ' ' 2>/dev/null < "$OC_WORK/opencode.log.status" || echo 'pas de statut')"
+            echo "- modèles : main/Forge $OC_MODEL_MAIN, Max $OC_MODEL_MAX, chaîne de secours ${OC_MODEL_CHAIN}"
+            echo "- journal complet : branche \`$LOGB\` (à part, jamais fusionnée ; absente si retirée par le contrôle anti-secrets ; à supprimer après lecture)"
+            echo
+            echo "## Commits du run"
+            git log --format='- %h %s' "$BASE_SHA..HEAD" || true
+            echo
+            echo "## Rapport de l'agent"
+            if [ -s "$OC_WORK/REPORT.md" ]; then cat "$OC_WORK/REPORT.md"; else echo "(aucun rapport écrit : relancer avec le même prompt pour reprendre)"; fi
+          } > "$R"
+          "${G[@]}" add -- "$R"
+          "${G[@]}" commit -q -m "chore(ci): rapport du run $IN_JOB" || true
+          # Journal opencode complet (sans ANSI, jetons masqués, 5 Mo max) : un commit sur $LOGB,
+          # construit hors de l'arbre de travail ; parent = dernier instantané en direct s'il y en a
+          # (le journal de fin remplace le fichier), sinon commit orphelin.
+          log_state="absent"; log_sha=""
+          if [ -s "$OC_WORK/opencode.log" ] && OC_ISA_KEY_FILE="$K" "$T/redact-log.sh" "$OC_WORK/opencode.log" "$OC_WORK/log.redacted"; then
+            rm -f "$OC_WORK/log.index"
+            if blob=$("${G[@]}" hash-object -w --no-filters "$OC_WORK/log.redacted") \
+               && GIT_INDEX_FILE="$OC_WORK/log.index" "${G[@]}" update-index --add --cacheinfo "100644,$blob,$LOGREL" \
+               && tree=$(GIT_INDEX_FILE="$OC_WORK/log.index" "${G[@]}" write-tree) \
+               && log_sha=$(GIT_AUTHOR_NAME=Nix GIT_AUTHOR_EMAIL=nix@galass.local GIT_COMMITTER_NAME=Nix \
+                    GIT_COMMITTER_EMAIL=nix@galass.local "${G[@]}" commit-tree "$tree" ${live_tip:+-p "$live_tip"} \
+                    -m "chore(ci): journal opencode du run $IN_JOB ($RUN_ID) — branche à supprimer après lecture") \
+               && "${G[@]}" update-ref "refs/heads/$LOGB" "$log_sha"; then
+              log_state="prêt"
+            else
+              log_sha=""; echo "::warning::commit du journal impossible : journal non poussé"
+            fi
+          fi
+          # Instantanés en direct poussés mais chaîne illisible ici : le journal de fin ne pourra pas
+          # s'y poser sans force ; il part aussi chiffré en artefact pour ne pas être perdu.
+          if [[ "$t" =~ ^[0-9a-f]{40}$ ]] && [ -z "$live_tip" ]; then
+            echo "::warning::chaîne du journal en direct illisible : journal de fin aussi chiffré en artefact"
+            archive_log journal-direct
+          fi
+          # Secrets : gitleaks (copie figée avant opencode) sur les seuls commits du run, sortie jamais affichée.
+          # Config et ignores pris au SHA de départ : l'IA ne peut pas assouplir le contrôle.
+          cfg=()
+          if git cat-file -e "$BASE_SHA:.gitleaks.toml" 2>/dev/null; then
+            git show "$BASE_SHA:.gitleaks.toml" > "$OC_WORK/gitleaks.toml"; cfg=(--config "$OC_WORK/gitleaks.toml")
+          fi
+          mkdir -p "$OC_WORK/gl-ignore"
+          if git cat-file -e "$BASE_SHA:.gitleaksignore" 2>/dev/null; then
+            git show "$BASE_SHA:.gitleaksignore" > "$OC_WORK/gl-ignore/.gitleaksignore"
+          fi
+          # Scan dans un dépôt nu neuf : ni .git/config ni attributs du run (diff.external,
+          # textconv…) ne peuvent masquer un contenu à gitleaks ou à la recherche de la clé.
+          S="$RUNNER_TEMP/scan.git"
+          # snap <branche> <sha attendu>
+          snap() {
+            rm -rf "$S" && git init -q --bare "$S" \
+              && git -C "$S" fetch -q --no-tags "file://$TARGET_DIR" "+refs/heads/$1:refs/heads/$1" >/dev/null 2>&1 \
+              && [ "$(git -C "$S" rev-parse "refs/heads/$1")" = "$2" ]
+          }
+          # scan <branche> <sha attendu> <plage> : 0 = propre, 1 = gitleaks, 2 = clé ISA, 3 = copie impossible.
+          scan() {
+            snap "$1" "$2" || return 3
+            "$T/gitleaks" git "${cfg[@]}" --gitleaks-ignore-path "$OC_WORK/gl-ignore" \
+              --log-opts="$3" --redact --no-banner \
+              --report-path "$OC_WORK/gitleaks.json" "$S" >/dev/null 2>&1 || return 1
+            if [ -s "$K" ]; then
+              git -C "$S" log -p --binary --no-ext-diff --no-textconv --format= "$3" > "$OC_WORK/run.diff"
+              if grep -qiF -- "$(tr -d '\n' < "$K")" "$OC_WORK/run.diff"; then return 2; fi
+            fi
+            return 0
+          }
+          why() {
+            case "$1" in 2) echo "la clé ISA apparaît" ;; 3) echo "copie de contrôle impossible" ;; *) echo "gitleaks a trouvé un secret probable" ;; esac
+          }
+          # Base du scan : dernier SHA poussé par le démon s'il est bien un ancêtre de HEAD ;
+          # sinon le SHA de départ (aucun commit du run n'échappe au contrôle).
+          scan_base="$BASE_SHA"
+          if [ -n "$wip_tip" ] && git merge-base --is-ancestor "$wip_tip" HEAD 2>/dev/null; then
+            scan_base="$wip_tip"
+          fi
+          src=0; scan "$IN_BRANCH" "$(git rev-parse HEAD)" "$scan_base..refs/heads/$IN_BRANCH" || src=$?
+          if [ "$src" -ne 0 ]; then
+            case "$src" in
+              2) fail_check cle "la clé ISA apparaît dans les commits du run : push refusé" ;;
+              3) fail_check copie "copie de contrôle impossible : push refusé" ;;
+              *) fail_check gitleaks "gitleaks a trouvé un secret probable dans les commits du run : push refusé" ;;
+            esac
+          fi
+          if [ -n "$log_sha" ]; then
+            # Seul le journal de fin est examiné : les instantanés en direct l'ont été avant envoi.
+            rng="refs/heads/$LOGB"; [ -n "$live_tip" ] && rng="$live_tip..refs/heads/$LOGB"
+            src=0; scan "$LOGB" "$log_sha" "$rng" || src=$?
+            if [ "$src" -ne 0 ]; then
+              git update-ref -d "refs/heads/$LOGB" 2>/dev/null || true
+              log_sha=""; log_state="retiré (contrôle anti-secrets)"
+              echo "::warning::$(why "$src") dans le journal : journal non poussé (le travail l'est)"
+              # Le journal ne part pas sur la branche : il part chiffré, sinon il est perdu.
+              if [ "$src" -eq 2 ]; then archive_log journal-cle; else archive_log journal-gitleaks; fi
+            fi
+          fi
+          # Journaux internes (opencode + hooks LifeOS) : même masquage (redact-log.sh) et même
+          # chiffrement (leaklog.sh, age) que le journal principal. Jamais affichés dans le log
+          # public du job ; artefact chiffré séparé, publié par le step suivant.
+          meta="$OC_WORK/opencode-meta.log"
+          rm -f "$meta" "$OC_WORK/meta.redacted"
+          for f in "$OC_INTERNAL_LOG" \
+                   "$HOME/.local/state/opencode-lifeos/hooks.log" \
+                   "$HOME/.local/state/opencode-lifeos/hook-failures.log"; do
+            [ -s "$f" ] || continue
+            printf '\n=== %s ===\n' "$(basename "$f")" >> "$meta"
+            cat "$f" >> "$meta"
+          done
+          if [ -s "$meta" ]; then
+            if OC_ISA_KEY_FILE="$K" "$T/redact-log.sh" "$meta" "$OC_WORK/meta.redacted" \
+               && mf=$("$T/leaklog.sh" "$OC_WORK/meta.redacted" - "internals" "$RUN_ID" "$ART" \
+                        "internes" "$RUN_URL" "$IN_BRANCH" "$BASE_SHA"); then
+              echo "meta_artifact=$(basename "$mf")" >> "$GITHUB_OUTPUT"
+              echo "- Journaux internes (hooks/opencode) : artefact chiffré \`$(basename "$mf")\`" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::chiffrement des journaux internes impossible : artefact non publié"
+            fi
+          else
+            echo "- Journaux internes : aucun fichier collecté" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          rm -f "$meta" "$OC_WORK/meta.redacted"
+          # Rejoue le validateur de fin depuis la copie figée : le moniteur le fait en boucle, on le
+          # refait ici, hors de portée d'opencode. Un échec ne bloque ni le rapport ni le push, il
+          # rend le statut final en échec (la vraie barrière du run).
+          vf="$OC_WORK/done-verify.sh"
+          {
+            echo 'set -u'
+            echo 'isa="${OC_ISA_PATH:-}"'
+            echo '[ -n "$isa" ] || exit 0'
+            echo '[ -f "$isa" ] || exit 1'
+            echo 'if [ -f LIFEOS/TOOLS/IsaFrontier.ts ]; then bun LIFEOS/TOOLS/IsaFrontier.ts validate "$isa"; fi'
+            echo 'if [ -f LIFEOS/TOOLS/CheckCompleteness.ts ]; then bun LIFEOS/TOOLS/CheckCompleteness.ts "$isa"; fi'
+            echo 'if [ -f LIFEOS/TOOLS/ISATool.ts ]; then bun LIFEOS/TOOLS/ISATool.ts verify "$isa"; fi'
+          } >"$vf"
+          dc_out=$(OC_DONE_VERIFY="$vf" OC_DONE_REPO="$TARGET_DIR" OC_ISA="${OC_ISA_PATH:-}" \
+                   OC_MAX_SUBAGENT=Max "$T/done_check.sh" 2>/dev/null | head -n1) || true
+          rm -f "$vf"
+          case "$dc_out" in
+            "done_check=ok")
+              echo "done=ok" >>"$GITHUB_OUTPUT"
+              echo "- Validateur de fin : ok" >>"$GITHUB_STEP_SUMMARY" ;;
+            done_check=ko\ raison=*)
+              dr="${dc_out#done_check=ko raison=}"
+              echo "done=ko" >>"$GITHUB_OUTPUT"
+              echo "done_reason=$dr" >>"$GITHUB_OUTPUT"
+              echo "- Validateur de fin : **échec** ($dr)" >>"$GITHUB_STEP_SUMMARY"
+              echo "::warning::validateur de fin : $dr" ;;
+            *)
+              echo "done=ko" >>"$GITHUB_OUTPUT"
+              echo "done_reason=script" >>"$GITHUB_OUTPUT"
+              echo "::warning::validateur de fin : sortie inattendue" ;;
+          esac
+          {
+            echo "commits=$(git rev-list --count "$BASE_SHA..HEAD")"
+            echo "head=$(git rev-parse HEAD)"
+            echo "log_sha=$log_sha"
+            echo "wip_pushed=$wip_tip"
+            echo "isc=$isc"
+          } >> "$GITHUB_OUTPUT"
+          lb=""; [ -n "$log_sha" ] && lb=" → branche \`$LOGB\` ($TARGET_REPO, à supprimer après lecture)"
+          echo "- Journal opencode privé : ${log_state}${lb}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Contrôles OK : $(git rev-list --count "$BASE_SHA..HEAD") commit(s) à pousser ; journal ${log_state}"
+
+      # Seul l'archive chiffrée sort du runner : le journal en clair ne quitte jamais la machine.
+      # Publier même quand le step de contrôle a échoué (c'est justement le cas qui la produit).
+      - name: Publier le journal chiffré (artefact 7 jours)
+        if: always() && steps.check.outputs.artifact != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.check.outputs.artifact }}
+          path: ${{ runner.temp }}/fullrun-artifact/${{ steps.check.outputs.artifact }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Publier les journaux internes chiffrés (artefact 7 jours)
+        if: always() && steps.check.outputs.meta_artifact != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.check.outputs.meta_artifact }}
+          path: ${{ runner.temp }}/fullrun-artifact/${{ steps.check.outputs.meta_artifact }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Push sur la branche de fonctionnalité (jamais main, jamais force) et journal à part
+        id: push
+        if: always() && steps.check.outcome == 'success'
+        env:
+          PUSH_TOKEN: ${{ secrets.GALASS_TOKEN }}
+          HEAD_SHA: ${{ steps.check.outputs.head }}
+          WIP_PUSHED: ${{ steps.check.outputs.wip_pushed }}
+          LOG_SHA: ${{ steps.check.outputs.log_sha }}
+          IN_BRANCH: ${{ inputs.branch }}
+          IN_JOB: ${{ inputs.job_name }}
+          RUN_ID: ${{ github.run_id }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_GIT: https://github.com/LordThiouk/${{ inputs.target_repo }}.git
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+        run: |
+          set +x
+          export PATH=/usr/bin:/bin
+          # Mêmes règles que la garde d'entrée, revérifiées ici (la valeur vient de l'entrée, pas de $GITHUB_ENV).
+          [[ "$IN_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || { echo "::error::branche invalide : push refusé"; exit 1; }
+          case "${IN_BRANCH,,}" in
+            main|master|head|refs/*|*..*|*/|*.lock|fullrun-logs/*|fullrun-prompts|fullrun-prompts/*) echo "::error::branche interdite : push refusé"; exit 1 ;;
+          esac
+          [[ "$IN_JOB" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$RUN_ID" =~ ^[0-9]{1,20}$ ]] || { echo "::error::job ou run invalide : push refusé"; exit 1; }
+          LOGB="fullrun-logs/${IN_JOB}-${RUN_ID}"
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA contrôlé absent : push refusé"; exit 1; }
+          [ -n "${PUSH_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
+          case "$TARGET_REPO" in
+            Galass_Driver|Galass_Rider|Galass_backend) ;;
+            *) echo "::error::target_repo invalide : push refusé"; exit 1 ;;
+          esac
+          [ "$TARGET_GIT" = "https://github.com/LordThiouk/${TARGET_REPO}.git" ] \
+            || { echo "::error::TARGET_GIT invalide : push refusé"; exit 1; }
+          # Push depuis un dépôt nu neuf : ni .git/config ni ~/.gitconfig (écrits par l'IA) ne s'appliquent.
+          B="$RUNNER_TEMP/push.git"; rm -rf "$B"
+          env -u PUSH_TOKEN git init -q --bare "$B"
+          # copie <branche> <sha contrôlé>
+          copie() {
+            env -u PUSH_TOKEN git -C "$B" -c protocol.file.allow=always fetch -q --no-tags \
+              "file://$TARGET_DIR" "+refs/heads/$1:refs/heads/$1" >/dev/null 2>&1 \
+              && [ "$(git -C "$B" rev-parse "refs/heads/$1")" = "$2" ]
+          }
+          auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          # pousse <sha> <branche> : en-tête passé par l'environnement de git seul (pas en argument
+          # visible dans ps), env vidé des proxys / GIT_* qu'opencode aurait pu poser ; jamais de force.
+          pousse() {
+            env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null \
+              GIT_CONFIG_KEY_1=http.https://github.com/.extraheader GIT_CONFIG_VALUE_1="AUTHORIZATION: basic $auth" \
+              /usr/bin/git -C "$B" push --no-verify --porcelain "$TARGET_GIT" \
+              "$1:refs/heads/$2" >/dev/null 2>&1
+          }
+          work=0
+          if [[ "${WIP_PUSHED:-}" =~ ^[0-9a-f]{40}$ ]] && [ "$WIP_PUSHED" = "$HEAD_SHA" ]; then
+            work=1; echo "Déjà poussé par le démon wip : $TARGET_REPO@$IN_BRANCH → ${HEAD_SHA:0:7} (pas de double push)"
+          elif ! copie "$IN_BRANCH" "$HEAD_SHA"; then
+            echo "::error::la branche a bougé après les contrôles, ou copie locale impossible : push refusé"
+          elif pousse "$HEAD_SHA" "$IN_BRANCH"; then
+            work=1; echo "Push OK : $TARGET_REPO@$IN_BRANCH → ${HEAD_SHA:0:7}"
+          else
+            echo "::error::push refusé (branche avancée ailleurs, ou jeton sans droit) : rien n'a été forcé"
+          fi
+          # Journal : branche dédiée. Créée par les instantanés en direct, le journal de fin s'y pose
+          # par-dessus (avance rapide) ; si elle a bougé autrement, refus (jamais de force).
+          logp=""
+          if [[ "$LOG_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            if copie "$LOGB" "$LOG_SHA" && pousse "$LOG_SHA" "$LOGB"; then
+              logp="$LOGB"; echo "Journal privé poussé : $TARGET_REPO@$LOGB"
+              echo "- Journal poussé sur la branche \`$LOGB\` de $TARGET_REPO (à supprimer après lecture)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::journal non poussé sur $LOGB (le travail n'est pas concerné)"
+            fi
+          fi
+          echo "log_branch=$logp" >> "$GITHUB_OUTPUT"
+          [ "$work" = 1 ] || exit 1
+
+      # PR en brouillon, jamais fusionnée : seulement quand le run s'est arrêté « terminé » et que
+      # le validateur de fin (Max PASS) est vert. Aucune autre opération gh que la création.
+      - name: PR en brouillon (jamais fusionnée)
+        id: pr
+        if: always() && steps.push.outcome == 'success' && steps.oc.outputs.stop == 'ok' && steps.check.outputs.done == 'ok'
+        continue-on-error: true
+        env:
+          PUSH_TOKEN: ${{ secrets.GALASS_TOKEN }}
+          IN_BRANCH: ${{ inputs.branch }}
+          IN_BASE: ${{ inputs.base_branch }}
+          IN_JOB: ${{ inputs.job_name }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +x
+          export PATH=/usr/local/bin:/usr/bin:/bin
+          case "$TARGET_REPO" in
+            Galass_Driver|Galass_Rider|Galass_backend) ;;
+            *) echo "::warning::target_repo invalide : pas de PR"; exit 0 ;;
+          esac
+          command -v gh >/dev/null 2>&1 || { echo "::warning::gh absent : pas de PR"; exit 0; }
+          [ -n "${PUSH_TOKEN:-}" ] || { echo "::warning::GALASS_TOKEN absent : pas de PR"; exit 0; }
+          base="$IN_BASE"
+          if [ -z "$base" ]; then
+            base=$(GH_TOKEN="$PUSH_TOKEN" gh api "repos/LordThiouk/$TARGET_REPO" --jq .default_branch 2>/dev/null) || base=""
+          fi
+          [[ "$base" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] \
+            || { echo "::warning::branche cible introuvable : pas de PR"; exit 0; }
+          existing=$(GH_TOKEN="$PUSH_TOKEN" gh pr list --repo "LordThiouk/$TARGET_REPO" --head "$IN_BRANCH" \
+                       --state open --json number --jq 'length' 2>/dev/null) || existing=0
+          if [ "$existing" != 0 ]; then
+            echo "- PR déjà ouverte pour \`$IN_BRANCH\` : rien à créer" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          url=$(GH_TOKEN="$PUSH_TOKEN" gh pr create --repo "LordThiouk/$TARGET_REPO" --draft \
+                  --base "$base" --head "$IN_BRANCH" \
+                  --title "FullRun ${IN_JOB} (${IN_BRANCH})" \
+                  --body "Run FullRun automatique. Journal et contrôles : ${RUN_URL}. PR en brouillon : revue humaine obligatoire, jamais de fusion automatique." 2>/dev/null) || url=""
+          [ -n "$url" ] || { echo "::warning::création de la PR impossible"; exit 0; }
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "- PR en brouillon : $url" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Statut final
+        if: always()
+        env:
+          OC_OUTCOME: ${{ steps.oc.outcome }}
+          OC_STOP: ${{ steps.oc.outputs.stop }}
+          OC_IDLE_MIN: ${{ inputs.idle_minutes }}
+          OC_WORK: ${{ runner.temp }}/oc
+          DONE: ${{ steps.check.outputs.done }}
+          DONE_REASON: ${{ steps.check.outputs.done_reason }}
+        run: |
+          set +x
+          case "${OC_STOP:-}" in
+            ok) why="terminé" ;;
+            silence) why="bloqué (silence $((10#$OC_IDLE_MIN)) min)" ;;
+            plafond) why="plafond atteint" ;;
+            vide) why="réponse vide (aucun token après reprises)" ;;
+            annulation) why="annulé" ;;
+            erreur) why="erreur opencode" ;;
+            *) why="non lancé ou interrompu" ;;
+          esac
+          # Erreurs agent : lignes `error=<type>` écrites par le moniteur. Comptage strict :
+          # seuls les quatre types connus, jamais le texte du modèle ni un secret.
+          errs=$(awk -F= '
+            /^error=(timeout|empty|provider|429)$/ { c[$2]++ }
+            END { printf "timeout=%d, empty=%d, provider=%d, 429=%d", c["timeout"], c["empty"], c["provider"], c["429"] }
+          ' "$OC_WORK/opencode.log.status" 2>/dev/null || true)
+          [ -n "$errs" ] || errs="timeout=0, empty=0, provider=0, 429=0"
+          echo "opencode : ${OC_OUTCOME:-non lancé} ; arrêt : $why ; erreurs agent : $errs"
+          echo "- Statut final opencode : **$why**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Erreurs agent : $errs" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Validateur de fin (Max PASS) : ${DONE:-non exécuté}${DONE_REASON:+ ($DONE_REASON)}" >> "$GITHUB_STEP_SUMMARY"
+          # Barrière : un run annoncé terminé sans PASS de Max vérifié n'est pas un succès.
+          if [ "${OC_STOP:-}" = ok ] && [ "${DONE:-}" != ok ]; then
+            echo "::error::run en échec : Max PASS non vérifié (${DONE_REASON:-done_check})"
+            exit 1
+          fi
+          [ "$OC_OUTCOME" = success ] || { echo "::error::run en échec : $why"; exit 1; }
+
+      # Notification de fin vers opencode-notify (même format que oc-run sur la box). Toujours,
+      # même après échec ou annulation ; ne fait jamais échouer le job. Contenu neutre : codes,
+      # raison, SHA, URL, ISC, modèle ; jamais de texte du modèle. URL et clé passées à curl par
+      # stdin (-K -), jamais en argument ni à l'écran ; aucun script du dépôt n'est lancé ici.
+      - name: Notification de fin (opencode-notify)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          OC_NOTIFY_URL: ${{ secrets.OC_NOTIFY_URL }}
+          OC_NOTIFY_KEY: ${{ secrets.OC_NOTIFY_KEY }}
+          JOB_STATUS: ${{ job.status }}
+          OC_STOP: ${{ steps.oc.outputs.stop }}
+          OC_RC: ${{ steps.oc.outputs.rc }}
+          OC_IDLE_MIN: ${{ inputs.idle_minutes }}
+          OC_JOB_T0: ${{ steps.guard.outputs.t0 }}
+          IN_JOB: ${{ inputs.job_name }}
+          OC_MODEL_MAIN: ${{ inputs.model_main }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+          LOG_BRANCH: ${{ steps.push.outputs.log_branch }}
+          LIVE_BRANCH: ${{ steps.live.outputs.branch }}
+          CHECK_REASON: ${{ steps.check.outputs.reason }}
+          DONE: ${{ steps.check.outputs.done }}
+          DONE_REASON: ${{ steps.check.outputs.done_reason }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          LOG_ARTIFACT: ${{ steps.check.outputs.artifact }}
+          HEAD_SHA: ${{ steps.check.outputs.head }}
+          ISC: ${{ steps.check.outputs.isc }}
+          OC_WORK: ${{ runner.temp }}/oc
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+        run: |
+          set +x
+          export PATH=/usr/bin:/bin
+          if [ -z "${OC_NOTIFY_URL:-}" ] || [ -z "${OC_NOTIFY_KEY:-}" ]; then
+            echo "::warning::secrets OC_NOTIFY_URL / OC_NOTIFY_KEY absents : notification ignorée"; exit 0
+          fi
+          case "${OC_STOP:-}" in
+            silence) status="bloqué"; why="bloqué (silence $((10#$OC_IDLE_MIN)) min)" ;;
+            plafond) status="échec"; why="plafond atteint" ;;
+            vide) status="échec"; why="réponse vide (aucun token après reprises)" ;;
+            annulation) status="annulé"; why="annulé" ;;
+            erreur) status="échec"; why="erreur opencode" ;;
+            ok) status="fini"; why="terminé" ;;
+            *) status="échec"; why="opencode non lancé ou interrompu" ;;
+          esac
+          if [ "$JOB_STATUS" = cancelled ] && [ "$status" != "annulé" ]; then status="annulé"; why="annulé ($why)"; fi
+          if [ "${CHECK_REASON:-}" = gitleaks ]; then
+            status="bloqué"
+            if [ -n "${LOG_ARTIFACT:-}" ]; then why="bloqué par gitleaks, journal chiffré en artefact"
+            else why="bloqué par gitleaks, journal chiffré impossible"; fi
+          fi
+          if [ "${DONE:-}" != ok ] && [ "$status" = fini ]; then
+            status="échec"
+            why="terminé, mais Max PASS non vérifié${DONE_REASON:+ ($DONE_REASON)}"
+          fi
+          [ "$JOB_STATUS" = success ] || [ "$status" != fini ] || { status="échec"; why="terminé, mais contrôles ou push en échec"; }
+          now=$(date +%s); t0="$OC_JOB_T0"
+          [[ "$t0" =~ ^[0-9]{9,11}$ && "$t0" -le "$now" ]] && dur=$(( now - t0 )) || dur=0
+          [[ "$OC_RC" =~ ^[0-9]{1,3}$ ]] || OC_RC="?"
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$PUSH_OUTCOME" = success ]] && sha="${HEAD_SHA:0:7}" || sha="aucun"
+          [[ "$ISC" =~ ^([0-9]{1,7}|\?)/([0-9]{1,7}|\?)$ ]] || ISC="?/?"
+          if ! [[ "$LOG_BRANCH" =~ ^fullrun-logs/[A-Za-z0-9._-]{1,90}$ ]]; then
+            # Journal de fin non poussé : la branche du journal en direct reste lisible.
+            if [[ "${LIVE_BRANCH:-}" =~ ^fullrun-logs/[A-Za-z0-9._-]{1,90}$ ]]; then LOG_BRANCH="${LIVE_BRANCH} (direct seulement)"
+            else LOG_BRANCH="aucun"; fi
+          fi
+          [[ "$LOG_ARTIFACT" =~ ^fullrun-log-[A-Za-z0-9._-]{1,80}\.age$ ]] || LOG_ARTIFACT="aucun"
+          # Erreurs agent : lignes `error=<type>` du moniteur, strictement typées (aucun secret,
+          # aucun texte du modèle). Le champ `errors` accompagne les champs existants.
+          errs_json=$(awk -F= '
+            /^error=(timeout|empty|provider|429)$/ { c[$2]++ }
+            END { printf "{\"timeout\":%d,\"empty\":%d,\"provider\":%d,\"429\":%d}", c["timeout"], c["empty"], c["provider"], c["429"] }
+          ' "$OC_WORK/opencode.log.status" 2>/dev/null || true)
+          if ! printf '%s' "$errs_json" | jq -e 'has("timeout") and has("empty") and has("provider") and has("429")' >/dev/null 2>&1; then
+            errs_json='{"timeout":0,"empty":0,"provider":0,"429":0}'
+          fi
+          errs_total=$(printf '%s' "$errs_json" | jq '[.[]] | add' 2>/dev/null || echo 0)
+          [[ "$errs_total" =~ ^[0-9]+$ ]] || errs_total=0
+          tail="exit=${OC_RC} · raison=${why} · sha poussé=${sha} · journal=${LOG_BRANCH} · artefact=${LOG_ARTIFACT} · ISC ${ISC} · modèle ${OC_MODEL_MAIN} · erreurs=${errs_total} · run ${RUN_URL}"
+          id=$(printf '%s:%s:%s:%s' "$IN_JOB" "$RUN_ID" "$RUN_ATTEMPT" "$status" | sha256sum | cut -d' ' -f1)
+          body="$RUNNER_TEMP/notify.json"
+          jq -nc --arg job "$IN_JOB" --arg status "$status" --argjson duration "$dur" --arg log_tail "$tail" \
+            --arg event_id "$id" --arg run_id "$RUN_ID" --argjson errors "$errs_json" --arg pr_url "${PR_URL:-}" \
+            '{job:$job,status:$status,duration:$duration,pr_url:$pr_url,log_tail:$log_tail,event_id:$event_id,run_id:$run_id,errors:$errors}' > "$body"
+          ok=0
+          for attempt in 1 2 3; do
+            code=$(printf 'url = "%s"\nheader = "Authorization: Bearer %s"\nheader = "X-Automation-Key: %s"\n' \
+                     "$OC_NOTIFY_URL" "$OC_NOTIFY_KEY" "$OC_NOTIFY_KEY" \
+                   | curl -sS -K - --max-time 15 -X POST -H "Content-Type: application/json" -H "Idempotency-Key: $id" \
+                       --data-binary "@$body" -o /dev/null -w '%{http_code}' 2>/dev/null) || code="000"
+            if [[ "$code" =~ ^2[0-9][0-9]$ ]]; then ok=1; break; fi
+            echo "notification : essai $attempt, HTTP ${code:0:3}"
+            [ "$attempt" -lt 3 ] && sleep $(( attempt * 10 ))
+          done
+          rm -f "$body"
+          if [ "$ok" = 1 ]; then echo "notification envoyée : $why"; else echo "::warning::notification non livrée après 3 essais (le job garde son statut)"; fi
