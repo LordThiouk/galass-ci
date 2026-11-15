@@ -303,6 +303,9 @@ jobs:
           C="$HOME/.config/opencode"
           cp "$CI_DIR/opencode/config/opencode.json" "$C/opencode.json"
           cp -r "$L/opencode/agent" "$L/opencode/command" "$L/opencode/plugins" "$C/"
+          # Profil FullRun : le plugin lit ~/.config/opencode/plugins/../hook-profiles/fullrun.json
+          # (copie depuis le checkout LifeOS). Un profil qui coupe un garde-fou arrête le job.
+          "$CI_DIR/opencode/install-hook-profile.sh" "$L" "$C"
           cp "$L/opencode/package.json" "$C/package.json"
           cp "$L/opencode/nix-lifeos.prompt.md" "$HOME/.local/share/opencode-lifeos/"
           # Le socle LifeOS n'est plus une `instructions` globale (chargée par CHAQUE sous-agent) :
@@ -406,7 +409,8 @@ jobs:
             "$CI_DIR/opencode/leaklog.sh" "$CI_DIR/opencode/livelog.sh" "$CI_DIR/opencode/progress.sh" \
             "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" \
             "$CI_DIR/opencode/extra-repos.sh" "$T/"
-          sudo install -o root -g root -m 0644 "$CI_DIR/opencode/log-recipient.txt" "$T/"
+          # Sourcé par extra-repos.sh, wippush.sh et livelog.sh depuis $T (pas le cwd).
+          sudo install -o root -g root -m 0644 "$CI_DIR/opencode/allowed-repos.sh" "$CI_DIR/opencode/log-recipient.txt" "$T/"
           rm -rf "$RUNNER_TEMP/gl" "$f"
           # Config gitleaks du dépôt cible au SHA de départ (même règle que le contrôle avant push).
           cd "$TARGET_DIR"
@@ -692,7 +696,7 @@ jobs:
           cd "$TARGET_DIR"
           # Outils figés avant opencode (root) : gitleaks, masquage, chiffrement, destinataire age.
           T=/opt/fullrun-tools; L=/opt/fullrun-live
-          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh log-recipient.txt; do
+          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh extra-repos.sh allowed-repos.sh log-recipient.txt; do
             [ -f "$T/$tool" ] || { echo "::error::outil figé absent ($tool) : push refusé"; exit 1; }
           done
           # Artefact chiffré (journal + rapport gitleaks) : publié seulement si un contrôle refuse.
@@ -1043,8 +1047,12 @@ jobs:
           LOGB="fullrun-logs/${IN_JOB}-${RUN_ID}"
           [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA contrôlé absent : push refusé"; exit 1; }
           [ -n "${PUSH_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
+          # Liste blanche figée depuis le checkout galass-ci (pas le répertoire courant,
+          # ni $CI_DIR après opencode, qui peut avoir été modifié).
+          T=/opt/fullrun-tools
+          [ -f "$T/allowed-repos.sh" ] || { echo "::error::allowed-repos.sh figé absent : push refusé"; exit 1; }
           # shellcheck source=opencode/allowed-repos.sh
-          . "$CI_DIR/opencode/allowed-repos.sh"
+          . "$T/allowed-repos.sh"
           allowed_repo "$TARGET_REPO" || { echo "::error::target_repo invalide : push refusé"; exit 1; }
           [ "$TARGET_GIT" = "https://github.com/LordThiouk/${TARGET_REPO}.git" ] \
             || { echo "::error::TARGET_GIT invalide : push refusé"; exit 1; }
@@ -1119,7 +1127,7 @@ jobs:
             main|master|head|refs/*|*..*|*/|*.lock|fullrun-logs/*|fullrun-prompts|fullrun-prompts/*) echo "::error::branche interdite : push des dépôts supplémentaires refusé"; exit 1 ;;
           esac
           T=/opt/fullrun-tools
-          if [ ! -f "$T/extra-repos.sh" ] || [ ! -f "$T/gitleaks" ]; then
+          if [ ! -f "$T/extra-repos.sh" ] || [ ! -f "$T/allowed-repos.sh" ] || [ ! -f "$T/gitleaks" ]; then
             echo "::error::outil figé absent : push des dépôts supplémentaires refusé"
             exit 1
           fi
@@ -1158,8 +1166,10 @@ jobs:
         run: |
           set +x
           export PATH=/usr/local/bin:/usr/bin:/bin
+          T=/opt/fullrun-tools
+          [ -f "$T/allowed-repos.sh" ] || { echo "::warning::allowed-repos.sh figé absent : pas de PR"; exit 0; }
           # shellcheck source=opencode/allowed-repos.sh
-          . "$CI_DIR/opencode/allowed-repos.sh"
+          . "$T/allowed-repos.sh"
           allowed_repo "$TARGET_REPO" || { echo "::warning::target_repo invalide : pas de PR"; exit 0; }
           command -v gh >/dev/null 2>&1 || { echo "::warning::gh absent : pas de PR"; exit 0; }
           [ -n "${PUSH_TOKEN:-}" ] || { echo "::warning::GALASS_TOKEN absent : pas de PR"; exit 0; }
@@ -1202,7 +1212,10 @@ jobs:
             exit 0
           fi
           T=/opt/fullrun-tools
-          [ -f "$T/extra-repos.sh" ] || { echo "::warning::outil figé absent : pas de PR supplémentaires"; exit 0; }
+          if [ ! -f "$T/extra-repos.sh" ] || [ ! -f "$T/allowed-repos.sh" ]; then
+            echo "::warning::outil figé absent : pas de PR supplémentaires"
+            exit 0
+          fi
           [ -n "${PUSH_TOKEN:-}" ] || { echo "::warning::GALASS_TOKEN absent : pas de PR supplémentaires"; exit 0; }
           printf '%s\n' "$PUSH_TOKEN" | EXTRA_TOKEN_STDIN=1 \
             EXTRA_STATE="${EXTRA_STATE:-$RUNNER_TEMP/extra-state}" \

@@ -14,8 +14,13 @@
 set +x
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ ! -f "$here/allowed-repos.sh" ]; then
+  echo "allowed-repos.sh introuvable : $here/allowed-repos.sh" >&2
+  exit 1
+fi
 # shellcheck source=opencode/allowed-repos.sh
 . "$here/allowed-repos.sh"
+type allowed_repo >/dev/null 2>&1 || { echo "allowed-repos.sh incomplet" >&2; exit 1; }
 : "${LIVE_STATE:?}" "${LIVE_LOG:?}" "${LIVE_JOB:?}" "${LIVE_RUN:?}"
 if [ -n "${LIVE_REMOTE:-}" ]; then
   REMOTE="$LIVE_REMOTE"
