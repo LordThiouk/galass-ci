@@ -122,6 +122,7 @@ opencode/tests/stall-resume-test.sh
 opencode/tests/watchdog-test.sh
 opencode/tests/wippush-test.sh
 opencode/tests/extra-repos-test.sh
+opencode/tests/allowed-repos-test.sh
 ```
 
 ## Limites et garde-fous

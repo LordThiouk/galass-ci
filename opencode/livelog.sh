@@ -14,15 +14,14 @@
 set +x
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=opencode/allowed-repos.sh
+. "$here/allowed-repos.sh"
 : "${LIVE_STATE:?}" "${LIVE_LOG:?}" "${LIVE_JOB:?}" "${LIVE_RUN:?}"
 if [ -n "${LIVE_REMOTE:-}" ]; then
   REMOTE="$LIVE_REMOTE"
 elif [ -n "${TARGET_REPO:-}" ]; then
-  case "$TARGET_REPO" in
-    Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub)
-      REMOTE="https://github.com/LordThiouk/${TARGET_REPO}.git" ;;
-    *) echo "TARGET_REPO invalide" >&2; exit 2 ;;
-  esac
+  allowed_repo "$TARGET_REPO" || { echo "TARGET_REPO invalide" >&2; exit 2; }
+  REMOTE="https://github.com/LordThiouk/${TARGET_REPO}.git"
 else
   echo "LIVE_REMOTE ou TARGET_REPO requis" >&2
   exit 2

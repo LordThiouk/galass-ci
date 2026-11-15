@@ -12,14 +12,10 @@
 set +x
 set -uo pipefail
 
-# Liste blanche unique des dépôts Galass (cible et extra_repos). Le workflow appelle parse
-# plutôt que de recopier cette liste.
-allowed_repo() {
-  case "$1" in
-    Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# Liste blanche : opencode/allowed-repos.sh (sourcé). Pas de copie ici.
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=opencode/allowed-repos.sh
+. "$here/allowed-repos.sh"
 
 valid_branch() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || return 1

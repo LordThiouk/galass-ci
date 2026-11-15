@@ -131,12 +131,8 @@ jobs:
           esac
           [[ "$IN_JOB" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail "job_name invalide"
           [[ "$IN_PROMPT" =~ ^(prompts|repo|ci):[A-Za-z0-9._/-]+$ && "$IN_PROMPT" != *..* ]] || fail "prompt_path invalide (prompts:<chemin>, repo:<chemin> ou ci:<chemin>)"
-          case "$TARGET_REPO" in
-            Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) ;;
-            *) fail "target_repo invalide (Galass_Driver, Galass_Rider, Galass_backend ou galass-emu-actions-pub)" ;;
-          esac
-          # extra_repos : validé après le checkout de galass-ci, via extra-repos.sh parse
-          # (liste blanche unique, pas de copie dans ce workflow).
+          # target_repo et extra_repos : validés après le checkout de galass-ci,
+          # via extra-repos.sh parse (liste blanche unique dans allowed-repos.sh).
           [[ "$IN_LIFEOS_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ && "$IN_LIFEOS_REF" != *..* ]] || fail "lifeos_ref invalide"
           if [ -n "$OC_ISA_PATH" ]; then
             [[ "$OC_ISA_PATH" =~ ^MEMORY/WORK/[A-Za-z0-9._-]+/ISA\.md$ && "$OC_ISA_PATH" != *..* ]] \
@@ -184,7 +180,7 @@ jobs:
           path: ci
           persist-credentials: false
 
-      - name: Valider extra_repos (liste blanche du script)
+      - name: Valider target_repo et extra_repos (liste blanche unique)
         run: |
           set +x
           fail() { echo "::error::$1"; exit 1; }
@@ -1047,10 +1043,9 @@ jobs:
           LOGB="fullrun-logs/${IN_JOB}-${RUN_ID}"
           [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA contrôlé absent : push refusé"; exit 1; }
           [ -n "${PUSH_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
-          case "$TARGET_REPO" in
-            Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) ;;
-            *) echo "::error::target_repo invalide : push refusé"; exit 1 ;;
-          esac
+          # shellcheck source=opencode/allowed-repos.sh
+          . "$CI_DIR/opencode/allowed-repos.sh"
+          allowed_repo "$TARGET_REPO" || { echo "::error::target_repo invalide : push refusé"; exit 1; }
           [ "$TARGET_GIT" = "https://github.com/LordThiouk/${TARGET_REPO}.git" ] \
             || { echo "::error::TARGET_GIT invalide : push refusé"; exit 1; }
           # Push depuis un dépôt nu neuf : ni .git/config ni ~/.gitconfig (écrits par l'IA) ne s'appliquent.
@@ -1163,10 +1158,9 @@ jobs:
         run: |
           set +x
           export PATH=/usr/local/bin:/usr/bin:/bin
-          case "$TARGET_REPO" in
-            Galass_Driver|Galass_Rider|Galass_backend|galass-emu-actions-pub) ;;
-            *) echo "::warning::target_repo invalide : pas de PR"; exit 0 ;;
-          esac
+          # shellcheck source=opencode/allowed-repos.sh
+          . "$CI_DIR/opencode/allowed-repos.sh"
+          allowed_repo "$TARGET_REPO" || { echo "::warning::target_repo invalide : pas de PR"; exit 0; }
           command -v gh >/dev/null 2>&1 || { echo "::warning::gh absent : pas de PR"; exit 0; }
           [ -n "${PUSH_TOKEN:-}" ] || { echo "::warning::GALASS_TOKEN absent : pas de PR"; exit 0; }
           base="$IN_BASE"
