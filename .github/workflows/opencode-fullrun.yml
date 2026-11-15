@@ -4,6 +4,12 @@ run-name: FullRun ${{ inputs.job_name }} → ${{ inputs.target_repo }}@${{ input
 # Longs jobs opencode (FullRun LifeOS) pour un dépôt Galass choisi par target_repo
 # (Galass_Driver, Galass_Rider, Galass_backend ou galass-emu-actions-pub).
 # Des dépôts supplémentaires optionnels (extra_repos) sont récupérés à côté, même branche.
+# with_emulators (défaut false) : donne à opencode /opt/fullrun-tools/emu-e2e.sh, qui
+# déclenche artemis-staging-e2e.yml sur LordThiouk/galass-emu-actions-pub (secrets e2e
+# déjà présents là-bas), attend le verdict, et n'en retire qu'un court extrait en échec.
+# Pas de démarrage local, pas de build APK, pas de secret e2e sur galass-ci. Pas de
+# FreeLLM, pas d'appel HTTP direct à un modèle. Les gardes FullRun (modèles
+# opencode/*-free, liste blanche, hooks, plafond mémoire) restent inchangées.
 # Dépôt PUBLIC : logs visibles par tous. La sortie d'opencode reste dans un fichier du
 # runner, jamais affichée ni publiée en artifact. Déclenchement manuel uniquement.
 on:
@@ -71,6 +77,11 @@ on:
         description: "Push des commits wip de la branche toutes les N min pendant le run (5 à 120)"
         type: string
         default: "30"
+      with_emulators:
+        description: "Si true, opencode pilote les e2e via galass-emu-actions-pub (emu-e2e.sh, vrai staging). Défaut false."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -116,6 +127,7 @@ jobs:
       TARGET_DIR: ${{ github.workspace }}/target
       TARGET_GIT: https://github.com/LordThiouk/${{ inputs.target_repo }}.git
       IN_EXTRA: ${{ inputs.extra_repos }}
+      WITH_EMULATORS: ${{ inputs.with_emulators }}
       EXTRA_ROOT: ${{ github.workspace }}/extra
       CI_DIR: ${{ github.workspace }}/ci
       OPENCODE_DISABLE_AUTOUPDATE: "1"
@@ -185,7 +197,8 @@ jobs:
           set +x
           fail() { echo "::error::$1"; exit 1; }
           [ -f "$CI_DIR/opencode/extra-repos.sh" ] || fail "extra-repos.sh absent : impossible de valider extra_repos"
-          if ! extras=$(EXTRA_REPOS_RAW="${IN_EXTRA:-}" TARGET_REPO="$TARGET_REPO"                  "$CI_DIR/opencode/extra-repos.sh" parse 2>"$RUNNER_TEMP/extra-parse.err"); then
+          raw="${IN_EXTRA:-}"
+          if ! extras=$(EXTRA_REPOS_RAW="$raw" TARGET_REPO="$TARGET_REPO"                  "$CI_DIR/opencode/extra-repos.sh" parse 2>"$RUNNER_TEMP/extra-parse.err"); then
             err=$(tr -d '\r' < "$RUNNER_TEMP/extra-parse.err" | head -n1)
             fail "${err:-extra_repos invalide}"
           fi
@@ -387,7 +400,6 @@ jobs:
           cat "$p" >> "$OC_WORK/prompt.md"
           echo "Prompt prêt ($(wc -l < "$OC_WORK/prompt.md") lignes), base $(git rev-parse --short HEAD)"
 
-
       # Avant opencode : gitleaks (épinglé, sha256 vérifié), les scripts de masquage, de chiffrement,
       # du journal en direct, des dépôts supplémentaires, et le destinataire age sont copiés en root
       # dans /opt/fullrun-tools.
@@ -397,6 +409,7 @@ jobs:
         env:
           ISA_STAMP_KEY: ${{ secrets.ISA_STAMP_KEY }}
           BASE_SHA: ${{ steps.prep.outputs.base }}
+          GALASS_TOKEN: ${{ secrets.GALASS_TOKEN }}
         run: |
           set +x
           T=/opt/fullrun-tools; L=/opt/fullrun-live
@@ -408,7 +421,7 @@ jobs:
           sudo install -o root -g root -m 0755 "$RUNNER_TEMP/gl/gitleaks" "$CI_DIR/opencode/redact-log.sh" \
             "$CI_DIR/opencode/leaklog.sh" "$CI_DIR/opencode/livelog.sh" "$CI_DIR/opencode/progress.sh" \
             "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" \
-            "$CI_DIR/opencode/extra-repos.sh" "$T/"
+            "$CI_DIR/opencode/extra-repos.sh" "$CI_DIR/opencode/emu-e2e.sh" "$T/"
           # Sourcé par extra-repos.sh, wippush.sh et livelog.sh depuis $T (pas le cwd).
           sudo install -o root -g root -m 0644 "$CI_DIR/opencode/allowed-repos.sh" "$CI_DIR/opencode/log-recipient.txt" "$T/"
           rm -rf "$RUNNER_TEMP/gl" "$f"
@@ -426,6 +439,35 @@ jobs:
           fi
           # Clé ISA pour le masquage du journal en direct : root, 0600.
           printf '%s' "${ISA_STAMP_KEY:-}" | sudo sh -c 'umask 077; cat > /opt/fullrun-live/isa.key'
+          # with_emulators : jeton GALASS_TOKEN hors d'opencode (fichier root 0600), état figé, sudoers strict.
+          if [ "${WITH_EMULATORS:-}" = "true" ]; then
+            [ -x "$CI_DIR/opencode/emu-e2e.sh" ] || { echo "::error::emu-e2e.sh absent : impossible d'activer with_emulators"; exit 1; }
+            [ -n "${GALASS_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
+            printf '::add-mask::%s\n' "$GALASS_TOKEN"
+            printf '%s\n' "$GALASS_TOKEN" | sudo sh -c 'umask 077; cat > /opt/fullrun-live/emu-e2e.token'
+            sudo chown root:root /opt/fullrun-live/emu-e2e.token
+            sudo chmod 0600 /opt/fullrun-live/emu-e2e.token
+            {
+              printf 'OC_BRANCH=%s\n' "$IN_BRANCH"
+              printf 'EMU_E2E_MODEL=deepseek-v4.1-flash-free\n'
+              printf 'EMU_E2E_TIMEOUT_SEC=10800\n'
+              printf 'EMU_E2E_POLL_SEC=30\n'
+              printf 'EMU_LOG_TAIL=80\n'
+              printf 'EMU_LOG_WIDTH=300\n'
+            } | sudo tee "$T/emu-e2e.state" >/dev/null
+            sudo chown root:root "$T/emu-e2e.state"
+            sudo chmod 0644 "$T/emu-e2e.state"
+            u=$(id -un)
+            {
+              printf 'Defaults!/opt/fullrun-tools/emu-e2e.sh env_reset\n'
+              printf 'Defaults!/opt/fullrun-tools/emu-e2e.sh secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n'
+              printf '%s ALL=(root) NOPASSWD: /opt/fullrun-tools/emu-e2e.sh run, /opt/fullrun-tools/emu-e2e.sh resolve-refs\n' "$u"
+            } | sudo tee /etc/sudoers.d/fullrun-emu-e2e >/dev/null
+            sudo chmod 0440 /etc/sudoers.d/fullrun-emu-e2e
+            sudo visudo -cf /etc/sudoers.d/fullrun-emu-e2e >/dev/null
+            [ -n "${OC_WORK:-}" ] && [ -f "$OC_WORK/prompt.md" ] && "$T/emu-e2e.sh" append-prompt
+            echo "outil e2e distant figé (emu-e2e.sh) : déclenchement via galass-emu-actions-pub"
+          fi
           "$T/gitleaks" version
           echo "Outils figés dans $T (root)"
 
@@ -602,6 +644,7 @@ jobs:
           OC_PROGRESS_INTERVAL: "600"
           OC_LIVE_BRANCH: ${{ steps.live.outputs.branch }}
           BASE_SHA: ${{ steps.prep.outputs.base }}
+          # Pas de secret e2e ni de jeton d'écriture dans l'environnement d'opencode.
         run: |
           set +x
           # Suivi : lignes [suivi] à valeurs filtrées (liste blanche / nombres), jamais le log lui-même.
@@ -696,7 +739,7 @@ jobs:
           cd "$TARGET_DIR"
           # Outils figés avant opencode (root) : gitleaks, masquage, chiffrement, destinataire age.
           T=/opt/fullrun-tools; L=/opt/fullrun-live
-          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh extra-repos.sh allowed-repos.sh log-recipient.txt; do
+          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh extra-repos.sh emu-e2e.sh allowed-repos.sh log-recipient.txt; do
             [ -f "$T/$tool" ] || { echo "::error::outil figé absent ($tool) : push refusé"; exit 1; }
           done
           # Artefact chiffré (journal + rapport gitleaks) : publié seulement si un contrôle refuse.
