@@ -73,6 +73,10 @@ on:
         description: "Agent figé : si le journal opencode n'écrit plus rien pendant N min (10 à 120), coupe et reprend la session (3 reprises max)"
         type: string
         default: "20"
+      done_agents:
+        description: "Agents dont un VRAI verdict PASS (réponse du sous-agent dans le stockage opencode) est exigé pour conclure : liste séparée par des virgules, ex. Max,Silas"
+        type: string
+        default: "Max"
       wip_push_minutes:
         description: "Push des commits wip de la branche toutes les N min pendant le run (5 à 120)"
         type: string
@@ -122,6 +126,7 @@ jobs:
       IN_LIFEOS_REF: ${{ inputs.lifeos_ref }}
       OC_ISA_PATH: ${{ inputs.isa_path }}
       IN_IDLE_MIN: ${{ inputs.idle_minutes }}
+      IN_DONE_AGENTS: ${{ inputs.done_agents }}
       IN_WIP_PUSH_MIN: ${{ inputs.wip_push_minutes }}
       TARGET_REPO: ${{ inputs.target_repo }}
       TARGET_DIR: ${{ github.workspace }}/target
@@ -153,6 +158,8 @@ jobs:
           if ! [[ "$IN_IDLE_MIN" =~ ^[0-9]{2,3}$ ]] || [ "$((10#$IN_IDLE_MIN))" -lt 10 ] || [ "$((10#$IN_IDLE_MIN))" -gt 120 ]; then
             fail "idle_minutes invalide (entier de 10 à 120)"
           fi
+          [[ "$IN_DONE_AGENTS" =~ ^[A-Za-z][A-Za-z0-9_-]{0,39}(,[A-Za-z][A-Za-z0-9_-]{0,39}){0,5}$ ]] \
+            || fail "done_agents invalide (noms séparés par des virgules, ex. Max,Silas)"
           if ! [[ "$IN_WIP_PUSH_MIN" =~ ^[0-9]{1,3}$ ]] || [ "$((10#$IN_WIP_PUSH_MIN))" -lt 5 ] || [ "$((10#$IN_WIP_PUSH_MIN))" -gt 120 ]; then
             fail "wip_push_minutes invalide (entier de 5 à 120)"
           fi
@@ -398,6 +405,12 @@ jobs:
           envsubst '$TARGET_DIR $TARGET_REPO $OC_BRANCH $OC_REPORT $OC_JOB $OC_MODEL_MAIN $OC_MODEL_MAX $EXTRA_ROOT $EXTRA_REPOS' \
             < "$CI_DIR/opencode/ci-preamble.md" > "$OC_WORK/prompt.md"
           cat "$p" >> "$OC_WORK/prompt.md"
+          # Relance d'un job : l'état d'avancement versionné sur la branche (étape validée, verdicts
+          # déjà obtenus) est injecté dans le prompt, pour reprendre à l'étape suivante. Copie de
+          # $CI_DIR (de confiance à ce stade, avant le gel root et avant opencode) ; donnée seulement.
+          if [ -s ".fullrun/${IN_JOB}_checkpoint.json" ] && [ ! -L ".fullrun" ] && [ ! -L ".fullrun/${IN_JOB}_checkpoint.json" ]; then
+            { echo; bash "$CI_DIR/opencode/checkpoint.sh" resume-text --job "$IN_JOB" --repo "$TARGET_DIR" | head -c 6000; } >> "$OC_WORK/prompt.md" || true
+          fi
           echo "Prompt prêt ($(wc -l < "$OC_WORK/prompt.md") lignes), base $(git rev-parse --short HEAD)"
 
       # Avant opencode : gitleaks (épinglé, sha256 vérifié), les scripts de masquage, de chiffrement,
@@ -420,7 +433,7 @@ jobs:
           sudo install -d -o root -g root -m 0755 "$T" "$L"
           sudo install -o root -g root -m 0755 "$RUNNER_TEMP/gl/gitleaks" "$CI_DIR/opencode/redact-log.sh" \
             "$CI_DIR/opencode/leaklog.sh" "$CI_DIR/opencode/livelog.sh" "$CI_DIR/opencode/progress.sh" \
-            "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" \
+            "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" "$CI_DIR/opencode/checkpoint.sh" \
             "$CI_DIR/opencode/extra-repos.sh" "$CI_DIR/opencode/emu-e2e.sh" "$T/"
           # Sourcé par extra-repos.sh, wippush.sh et livelog.sh depuis $T (pas le cwd).
           sudo install -o root -g root -m 0644 "$CI_DIR/opencode/allowed-repos.sh" "$CI_DIR/opencode/log-recipient.txt" "$T/"
@@ -635,6 +648,7 @@ jobs:
           OC_REPORT: ${{ runner.temp }}/oc/REPORT.md
           OC_LOG: ${{ runner.temp }}/oc/opencode.log
           OC_IDLE_MIN: ${{ inputs.idle_minutes }}
+          OC_DONE_AGENTS: ${{ inputs.done_agents }}
           OC_JOB_T0: ${{ steps.guard.outputs.t0 }}
           # Doit rester égal à timeout-minutes du job (350) ; marge de push : 15 min.
           OC_JOB_TIMEOUT_MIN: "350"
@@ -740,7 +754,7 @@ jobs:
           cd "$TARGET_DIR"
           # Outils figés avant opencode (root) : gitleaks, masquage, chiffrement, destinataire age.
           T=/opt/fullrun-tools; L=/opt/fullrun-live
-          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh extra-repos.sh emu-e2e.sh allowed-repos.sh log-recipient.txt; do
+          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh checkpoint.sh extra-repos.sh emu-e2e.sh allowed-repos.sh log-recipient.txt; do
             [ -f "$T/$tool" ] || { echo "::error::outil figé absent ($tool) : push refusé"; exit 1; }
           done
           # Artefact chiffré (journal + rapport gitleaks) : publié seulement si un contrôle refuse.
@@ -1010,7 +1024,7 @@ jobs:
             echo 'if [ -f LIFEOS/TOOLS/ISATool.ts ]; then bun LIFEOS/TOOLS/ISATool.ts verify "$isa"; fi'
           } >"$vf"
           dc_out=$(OC_DONE_VERIFY="$vf" OC_DONE_REPO="$TARGET_DIR" OC_ISA="${OC_ISA_PATH:-}" \
-                   OC_MAX_SUBAGENT=Max "$T/done_check.sh" 2>/dev/null | head -n1) || true
+                   OC_MAX_SUBAGENT=Max OC_DONE_AGENTS="$IN_DONE_AGENTS" "$T/done_check.sh" 2>/dev/null | head -n1) || true
           rm -f "$vf"
           case "$dc_out" in
             "done_check=ok")
@@ -1332,6 +1346,7 @@ jobs:
           OC_STOP: ${{ steps.oc.outputs.stop }}
           OC_RC: ${{ steps.oc.outputs.rc }}
           OC_IDLE_MIN: ${{ inputs.idle_minutes }}
+          OC_DONE_AGENTS: ${{ inputs.done_agents }}
           OC_JOB_T0: ${{ steps.guard.outputs.t0 }}
           IN_JOB: ${{ inputs.job_name }}
           OC_MODEL_MAIN: ${{ inputs.model_main }}

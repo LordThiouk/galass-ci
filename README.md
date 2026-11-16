@@ -123,9 +123,26 @@ opencode/tests/livelog-test.sh
 opencode/tests/stall-resume-test.sh
 opencode/tests/watchdog-test.sh
 opencode/tests/wippush-test.sh
+opencode/tests/checkpoint-watchdog-verdict-test.sh
 opencode/tests/extra-repos-test.sh
 opencode/tests/allowed-repos-test.sh
 ```
+
+## Reprise, surveillance, verdicts réels
+
+- **Reprise depuis la dernière étape.** Après chaque étape validée, l'agent appelle
+  `/opt/fullrun-tools/checkpoint.sh write --job J --step N …` : `.fullrun/<job>_checkpoint.json`
+  (étape, commit, résumé, verdicts), pas de saut d'étape. À chaque reprise (`stall_resume`,
+  `new_session`) et à chaque relance du job, le prompt reçoit ce fichier et le début de `_DONE.md`
+  avec l'ordre de reprendre à l'étape suivante ; un verdict encore valable (aucun commit de code
+  depuis son SHA) n'est pas redemandé. Le fichier est un indice, pas une preuve.
+- **Ne pas couper un travail en cours.** Comptent comme activité : le journal, les fichiers de
+  session (sous-agents) et le CPU des processus ENFANTS de l'agent (`OC_CHILD_CPU_MIN`, 10 ticks par
+  sonde). Coupure après `OC_IDLE_MIN` minutes sans aucune de ces activités ; le seuil fixe de 8 min
+  n'est plus appliqué par défaut (`OC_SUBAGENT_IDLE_SEC` reste un plafond optionnel).
+- **Verdicts réels seulement.** `done_check.sh` exige, pour chaque agent de `OC_DONE_AGENTS` (entrée
+  `done_agents`, défaut `Max`, ex. `Max,Silas`), une vraie tâche terminée dans le stockage opencode
+  et la ligne `SUBAGENT done` du plugin ; un PASS écrit par l'agent principal ne compte pas.
 
 ## Limites et garde-fous
 
