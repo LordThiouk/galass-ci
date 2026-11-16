@@ -6,6 +6,7 @@
 
 # Clés, jetons, identifiants, configuration d'environnement
 .env
+keys.json
 .env.*
 auth.json
 *credential*
