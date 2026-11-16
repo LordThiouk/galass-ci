@@ -8,7 +8,9 @@ set -euo pipefail
 
 err() {
   if [ -n "${GITHUB_ACTIONS:-}" ]; then
-    echo "::error::$1"
+    # Annotation utiles aux logs CI, mais le refus doit rester lisible sur stderr : c'est là que
+    # les appelants et les tests le lisent (sinon le refus passe pour un silence).
+    echo "::error::$1" >&2
   else
     echo "$1" >&2
   fi
