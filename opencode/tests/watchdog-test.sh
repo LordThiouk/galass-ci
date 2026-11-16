@@ -62,8 +62,11 @@ for _ in $(seq 1 60); do
 done
 [[ "$w1" =~ ^[0-9]{1,9}$ ]] || ko "worker.pid absent (cas 2)"
 kill -TERM "$w1" 2>/dev/null || true
-for _ in $(seq 1 80); do grep -q 'relance' "$dout2" 2>/dev/null && break; sleep 0.1; done
-grep -q 'relance' "$dout2" || ko "passage tué non relancé : $(cat "$dout2")"
+# Le signal est envoyé au `timeout` du passage. Selon coreutils, tuer `timeout` rend 143
+# (« relance ») ou 124 (« délai dépassé ») : les deux disent « passage interrompu ». Exiger le
+# texte exact rendait ce test rouge sur les runners (coreutils 9.4) alors que la relance marchait.
+for _ in $(seq 1 80); do grep -q 'passage interrompu' "$dout2" 2>/dev/null && break; sleep 0.1; done
+grep -q 'passage interrompu' "$dout2" || ko "passage tué non signalé : $(cat "$dout2")"
 kill -0 "$pid2" 2>/dev/null || ko "le superviseur est mort avec le passage"
 w2=""
 for _ in $(seq 1 60); do
@@ -71,7 +74,7 @@ for _ in $(seq 1 60); do
   [[ "$w2" =~ ^[0-9]{1,9}$ && "$w2" != "$w1" ]] && break
   sleep 0.05
 done
-[ -n "$w2" ] && [ "$w2" != "$w1" ] || ko "aucun nouveau passage après le kill"
+[ -n "$w2" ] && [ "$w2" != "$w1" ] || ko "passage tué non relancé : aucun nouveau passage (pas de relance)"
 kill -TERM "$pid2"
 for _ in $(seq 1 40); do kill -0 "$pid2" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$pid2" 2>/dev/null && { kill -KILL "$pid2"; ko "le superviseur ne s'arrête pas (cas 2)"; }

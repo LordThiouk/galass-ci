@@ -12,6 +12,15 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 key="${AGE_KEY:-$HOME/.config/age/fullrun-logs.key}"
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
+# Destinataire du chiffrement : log-recipient.txt sur la box (clé privée présente), sinon une
+# paire jetable — sinon la CI ne peut pas vérifier le déchiffrement et perd cette couverture.
+rcp_note="clé privée du dépôt"
+if [ ! -f "$key" ]; then
+  age-keygen -o "$tmp/jetable.key" >/dev/null 2>&1 || { echo "FAIL age-keygen"; exit 1; }
+  key="$tmp/jetable.key"
+  OC_LOG_RECIPIENT=$(age-keygen -y "$key"); export OC_LOG_RECIPIENT
+  rcp_note="paire jetable"
+fi
 gl=$(find_gitleaks "$tmp") || ko "gitleaks introuvable"
 command -v age >/dev/null || ko "age absent"
 remote="$tmp/remote.git"; git init -q --bare "$remote"
@@ -54,7 +63,7 @@ if [ -f "$key" ]; then
   git -C "$remote" show "$c2:.fullrun/logs/testjob-42.age" | age -d -i "$key" | tar -xz -C "$tmp/x" || ko "déchiffrement impossible"
   grep -q 'suite du travail' "$tmp/x/opencode.log" || ko "journal déchiffré incomplet"
   jq -e 'length >= 1' "$tmp/x/gitleaks.json" >/dev/null || ko "rapport gitleaks absent"
-  ok "instantané chiffré : age -d -i ~/.config/age/fullrun-logs.key le déchiffre"
+  ok "instantané chiffré : age -d -i <$rcp_note> le déchiffre"
 fi
 
 # --- 3. dépôt distant injoignable : essais bornés, pas d'erreur, état local conservé ---------

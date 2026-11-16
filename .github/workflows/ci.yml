@@ -17,6 +17,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # leaklog-test / livelog-test exigent `age` (chiffrement du journal) ; sans lui ils
+      # échouent en « age absent ». Même binaire épinglé + sha256 que le workflow FullRun.
+      - name: Installer age (épinglé, sha256 vérifié)
+        env:
+          AGE_VERSION: "1.2.1"
+          AGE_SHA256: "7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50"
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/age.tgz"
+          curl -sSfL -o "$f" "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-linux-amd64.tar.gz"
+          echo "${AGE_SHA256}  $f" | sha256sum -c --quiet
+          tar -xzf "$f" -C "$RUNNER_TEMP" age/age age/age-keygen
+          sudo install -m 0755 "$RUNNER_TEMP/age/age" /usr/local/bin/age
+          sudo install -m 0755 "$RUNNER_TEMP/age/age-keygen" /usr/local/bin/age-keygen
+          age --version
       - name: Tests opencode
         run: |
           set -euo pipefail
