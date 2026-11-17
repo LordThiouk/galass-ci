@@ -14,7 +14,8 @@
 #    seul). À la reprise n° i, m = chaîne[(i-1) % longueur], passé en `--model` ET en OC_MODEL_MAIN,
 #    puis réécrit dans $OC_AGENT_DIR/*.md pour que les sous-agents changent aussi ; chaque élément
 #    doit être `opencode/...-free` et différer du principal (sinon code 90) ;
-#  - sous-agent : l'activité des enfants et des sessions compte ; coupure après OC_IDLE_MIN sans rien ; la
+#  - sous-agent : l'activité des enfants et des sessions compte ; coupure après OC_IDLE_MIN sans rien (un
+#    seuil PAR AGENT plus long, OC_AGENT_IDLE_MIN défaut Forge=40, prolonge l'attente de l'agent en cours) ; la
 #    coupure écrit `type=timeout` + `subagent_timeout=1` (verdict MANQUANT, jamais un pass) ;
 #  - fin anticipée : done_check.sh (copie figée /opt/fullrun-tools) vérifie Max PASS réel,
 #    hooks.log, vérificateurs OC_DONE_VERIFY, arbre propre et REPORT.md ; si ok et session inactive
