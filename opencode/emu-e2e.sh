@@ -6,6 +6,7 @@
 # sur galass-ci. Le jeton (GALASS_TOKEN) n'est jamais affiché ni passé à opencode.
 #
 #   emu-e2e.sh run            déclenche, attend, affiche le verdict
+#   emu-e2e.sh status <run_id> état du run (lecture seule, id numérique) : status=… conclusion=…
 #   emu-e2e.sh resolve-refs   affiche rider_ref et driver_ref
 #   emu-e2e.sh prompt-block   bloc à ajouter au prompt (aucun secret)
 #   emu-e2e.sh append-prompt  ajoute le bloc à $OC_WORK/prompt.md
@@ -30,6 +31,8 @@ DEFAULT_LOG_TAIL=80
 DEFAULT_LOG_WIDTH=300
 # Plafond par appel gh : un appel réseau qui pend ne doit jamais bloquer la boucle d'attente.
 DEFAULT_GH_TIMEOUT_SEC=60
+# Après TERM, KILL au bout de N s : un gh qui ignore TERM ne bloque pas non plus.
+GH_KILL_AFTER_SEC=5
 # Lectures consécutives du run en échec avant d'abandonner (erreurs transitoires tolérées).
 MAX_VIEW_FAILS=5
 FALLBACK_REF="main"
@@ -41,7 +44,7 @@ fail() { echo "$1" >&2; exit 1; }
 maybe_sudo() {
   local cmd="${1:-}"
   case "$cmd" in
-    run|resolve-refs) ;;
+    run|resolve-refs|status) ;;
     *) return 0 ;;
   esac
   [ "$(id -u)" -eq 0 ] && return 0
@@ -209,6 +212,15 @@ la commande en boucle.
   \`opencode/deepseek-v4.1-flash-free\`). Le CLI opencode (pas une clé API)
   pilote les émulateurs sur le dépôt emu. Pas de FreeLLM, pas d'appel HTTP
   direct à un modèle. Les modèles FullRun restent \`opencode/*-free\`.
+- Lancement : l'outil dure jusqu'à la fin du run (plusieurs dizaines de minutes) ; lance-le en
+  tâche de fond détachée, en deux commandes séparées : d'abord \`LOG=/tmp/fullrun/e2e-run.log\`,
+  puis \`setsid nohup sudo -n -H -- env GITHUB_ACTIONS=true /opt/fullrun-tools/emu-e2e.sh run
+  > "\$LOG" 2>&1 < /dev/null &\`. Jamais \`A && B && nohup … &\` : le sous-shell garde la
+  sortie de ton outil ouverte, l'outil est tué au délai et le script avec lui.
+- Chaque sondage écrit une ligne datée dans ce log. Ne dors pas plus de 2 cycles sur un log qui
+  ne bouge plus : lis l'état réel avec \`sudo -n -H -- /opt/fullrun-tools/emu-e2e.sh status <run_id>\`
+  (lecture seule, l'équivalent de \`gh run view\`, sans jeton chez toi) et passe à la suite si le
+  run est \`status=completed\` (le verdict est dans \`conclusion=\`), ou signale le blocage.
 - Tu n'as aucun jeton : n'utilise pas \`gh\` toi-même, n'invente pas de secret,
   n'écris aucun secret. Passe seulement par le script figé ci-dessus
   (pas une copie dans le workspace).
@@ -259,12 +271,11 @@ if out:
 gh_cmd() {
   local gh
   gh=$(gh_bin)
-  # Chaque appel est plafonné (timeout → rc 124) : un gh qui pend ne bloque jamais l'attente.
-  if command -v timeout >/dev/null 2>&1; then
-    GH_TOKEN="$token" GH_PROMPT_DISABLED=1 timeout "${EMU_E2E_GH_TIMEOUT_SEC:-$DEFAULT_GH_TIMEOUT_SEC}" "$gh" "$@"
-  else
-    GH_TOKEN="$token" GH_PROMPT_DISABLED=1 "$gh" "$@"
-  fi
+  # Chaque appel est plafonné : TERM à la limite puis KILL 5 s après (rc 124/137). Pas de repli
+  # sans plafond : sans `timeout`, on refuse plutôt que de risquer une attente infinie.
+  command -v timeout >/dev/null 2>&1 || fail "timeout introuvable : appel gh non borné refusé"
+  GH_TOKEN="$token" GH_PROMPT_DISABLED=1 \
+    timeout -k "$GH_KILL_AFTER_SEC" "${EMU_E2E_GH_TIMEOUT_SEC:-$DEFAULT_GH_TIMEOUT_SEC}" "$gh" "$@"
 }
 
 find_new_run() {
@@ -288,14 +299,53 @@ view_run() {
   gh_cmd run view "$1" -R "$EMU_REPO" --json status,conclusion,url,displayTitle
 }
 
+# Lecture seule d'un run déjà lancé : l'agent n'a pas de jeton, il passe par ici (sudo) au lieu
+# de relire un log qui ne bouge plus. Une ligne, rc 0 si lu, 1 sinon.
+# Chien de garde : échéance dure = délai + un dernier tour de sondage + deux appels gh plafonnés.
+# Passé ce délai, USR1 au processus principal (trap → verdict=timeout, exit 124).
+watchdog_start() {
+  local hard main=$$
+  hard=$(( EMU_E2E_TIMEOUT_SEC + EMU_E2E_POLL_SEC + 2 * (EMU_E2E_GH_TIMEOUT_SEC + GH_KILL_AFTER_SEC) + 30 ))
+  (
+    sleep "$hard" & sp=$!
+    trap 'kill "$sp" 2>/dev/null; exit 0' TERM
+    wait "$sp" && kill -USR1 "$main" 2>/dev/null
+  ) &
+  WATCHDOG_PID=$!
+  trap 'kill "$WATCHDOG_PID" 2>/dev/null' EXIT
+}
+
+status_run() {
+  local id="${1:-}" view
+  [[ "$id" =~ ^[0-9]{1,20}$ ]] || fail "status : identifiant de run numérique requis"
+  load_config
+  read_token
+  view=$(view_run "$id" 2>/dev/null) || { echo "status=illisible run=${id}"; return 1; }
+  python3 -c '
+import json,sys
+d=json.loads(sys.argv[1])
+print("status=%s conclusion=%s run=%s" % (d.get("status") or "?", d.get("conclusion") or "-", sys.argv[2]))
+' "$view" "$id"
+}
+
 run_e2e() {
-  local since run_id deadline status conclusion url view s_status s_conclusion s_url
+  local since run_id deadline status conclusion url view s_status s_conclusion s_url t_start finds=0
   load_config
   EMU_E2E_MODEL=$(validate_model "$EMU_E2E_MODEL")
   if [ "${GITHUB_ACTIONS:-}" != "true" ] && [ -z "${EMU_E2E_GH:-}" ]; then
     fail "refus : lancer seulement depuis le FullRun (ou un test avec EMU_E2E_GH)"
   fi
   read_token
+  t_start=$(date +%s)
+  RUN_ID_CUR=""
+  # Sortie garantie : un signal (TERM/INT/HUP) ou le chien de garde laisse TOUJOURS une ligne
+  # verdict= dans le log, jamais un log muet. SIGKILL ne se piège pas : c'est pourquoi chaque
+  # sondage écrit aussi une ligne datée (un log figé = processus mort ou bloqué, détectable).
+  trap 'echo "verdict=interrompu signal=TERM run=${RUN_ID_CUR:-?}"; exit 143' TERM
+  trap 'echo "verdict=interrompu signal=INT run=${RUN_ID_CUR:-?}"; exit 130' INT
+  trap 'echo "verdict=interrompu signal=HUP run=${RUN_ID_CUR:-?}"; exit 129' HUP
+  trap 'echo "verdict=timeout watchdog run=${RUN_ID_CUR:-?} (échéance dure dépassée)"; exit 124' USR1
+  watchdog_start
   rider_ref=$(resolve_one "$RIDER_REPO")
   driver_ref=$(resolve_one "$DRIVER_REPO")
   echo "déclenchement : $EMU_REPO $EMU_WORKFLOW"
@@ -321,10 +371,13 @@ run_e2e() {
       [ -n "$run_id" ] && break
     fi
     run_id=""
+    finds=$(( finds + 1 ))
+    echo "$(date -u +%H:%M:%S) attente du démarrage du run : sondage ${finds} (+$(( $(date +%s) - t_start ))s)"
     [ "$EMU_E2E_POLL_SEC" -gt 0 ] && sleep "$EMU_E2E_POLL_SEC"
     [ "$EMU_E2E_POLL_SEC" -eq 0 ] && sleep 1
   done
   [ -n "$run_id" ] || fail "aucun run e2e trouvé avant le délai (déclenchement peut-être refusé)"
+  RUN_ID_CUR="$run_id"
   echo "run=${run_id} https://github.com/${EMU_REPO}/actions/runs/${run_id}"
 
   # Attente bornée de l'état du run : on sort dès que status=completed (ou qu'une
@@ -351,12 +404,14 @@ for k in ("status","conclusion","url"):
       status="$s_status"
       conclusion="$s_conclusion"
       url="$s_url"
+      echo "$(date -u +%H:%M:%S) sondage ${polls}/${max_polls} (+$(( $(date +%s) - t_start ))s) run=${run_id} status=${status:-?} conclusion=${conclusion:--}"
       if [ "$status" = "completed" ] || [ "$status" = "cancelled" ] || [ -n "$conclusion" ]; then
         [ "$status" = "completed" ] || status="completed"
         break
       fi
     else
       view_fails=$(( view_fails + 1 ))
+      echo "$(date -u +%H:%M:%S) sondage ${polls}/${max_polls} (+$(( $(date +%s) - t_start ))s) run=${run_id} lecture en échec (${view_fails}/${MAX_VIEW_FAILS})"
       [ "$view_fails" -lt "$MAX_VIEW_FAILS" ] \
         || fail "impossible de lire le run ${run_id} (${view_fails} échecs consécutifs)"
     fi
@@ -388,12 +443,13 @@ for k in ("status","conclusion","url"):
 
 cmd="${1:-}"
 case "$cmd" in
-  run|resolve-refs) maybe_sudo "$@" ;;
+  run|resolve-refs|status) maybe_sudo "$@" ;;
 esac
 
 case "$cmd" in
   run) run_e2e ;;
   resolve-refs) resolve_refs ;;
+  status) shift; status_run "${1:-}" ;;
   prompt-block) prompt_block ;;
   append-prompt) append_prompt ;;
   *) fail "commande inconnue : ${cmd:-<vide>}" ;;

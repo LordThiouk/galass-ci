@@ -306,6 +306,72 @@ printf '%s' "$wait_out" | grep -q 'impossible de lire le run' || ko "lecture cas
 [ "$wait_views" -le 5 ] || ko "lecture cassée : $wait_views lectures (max 5)"
 ok "attente : lecture cassée → abandon après ${wait_views} échecs consécutifs"
 
+# --- 3c. cause du log figé (run 44163682423) : appels bloqués, sortie garantie --
+# Mode deaf : gh ignore TERM (et ses enfants aussi) → seul KILL le libère.
+sed 's|hang)   sleep 30;|hang)   trap "" TERM; sleep 30;|' "$tmp/mock-gh-wait" > "$tmp/mock-gh-deaf"
+chmod +x "$tmp/mock-gh-deaf"
+: > "$tmp/view.count"
+start=$SECONDS
+set +e
+deaf_out=$(MOCK_MODE=hang MOCK_COUNT="$tmp/view.count" EMU_E2E_GH="$tmp/mock-gh-deaf" \
+  EMU_E2E_TIMEOUT_SEC=3 EMU_E2E_POLL_SEC=0 EMU_E2E_GH_TIMEOUT_SEC=1 "$sh" run 2>&1)
+deaf_rc=$?
+set -e
+deaf_elapsed=$(( SECONDS - start ))
+[ "$deaf_rc" -eq 124 ] || ko "gh sourd à TERM : rc=$deaf_rc (attendu 124) : $deaf_out"
+[ "$deaf_elapsed" -lt 25 ] || ko "gh sourd à TERM : ${deaf_elapsed}s, KILL de secours absent (timeout -k)"
+grep -q 'timeout -k' "$sh" || ko "gh_cmd doit utiliser timeout -k (KILL après TERM)"
+ok "gh bloqué et sourd à TERM : tué par KILL, sortie 124 en ${deaf_elapsed}s"
+
+# Une ligne datée à chaque sondage : un log qui ne bouge plus est un processus mort/bloqué.
+set +e
+beat_out=$(EMU_E2E_GH="$tmp/mock-gh-hang" EMU_E2E_TIMEOUT_SEC=4 EMU_E2E_POLL_SEC=1 "$sh" run 2>&1)
+set -e
+beats=$(printf '%s\n' "$beat_out" | grep -cE '^[0-9]{2}:[0-9]{2}:[0-9]{2} sondage [0-9]+/[0-9]+ .*status=in_progress')
+[ "$beats" -ge 2 ] || ko "heartbeat : $beats ligne(s) de sondage datée(s) (attendu >= 2) : $beat_out"
+ok "sondages : une ligne datée par lecture ($beats lignes en 4 s)"
+
+# Sortie garantie : TERM, HUP et USR1 (chien de garde) laissent un verdict= dans le log.
+# INT est ignoré par construction pour un job lancé en arrière-plan (for sig in TERM INT HUP USR1; do) : non testable ici.
+for sig in TERM HUP USR1; do
+  : > "$tmp/bg.log"
+  EMU_E2E_GH="$tmp/mock-gh-hang" EMU_E2E_TIMEOUT_SEC=60 EMU_E2E_POLL_SEC=0 "$sh" run > "$tmp/bg.log" 2>&1 < /dev/null &
+  bgpid=$!
+  for _ in $(seq 1 40); do grep -q '^run=' "$tmp/bg.log" 2>/dev/null && break; sleep 0.25; done
+  grep -q '^run=' "$tmp/bg.log" || { kill -9 "$bgpid" 2>/dev/null; ko "signal $sig : le script n'a pas atteint l'attente : $(cat "$tmp/bg.log")"; }
+  kill -"$sig" "$bgpid"
+  set +e; wait "$bgpid"; bg_rc=$?; set -e
+  case "$sig" in
+    USR1) want='verdict=timeout watchdog'; want_rc=124 ;;
+    *)    want="verdict=interrompu signal=$sig"; want_rc=$(( 128 + $(kill -l "$sig") )) ;;
+  esac
+  grep -q "$want" "$tmp/bg.log" || ko "signal $sig : '$want' absent du log : $(cat "$tmp/bg.log")"
+  [ "$bg_rc" -eq "$want_rc" ] || ko "signal $sig : rc=$bg_rc (attendu $want_rc)"
+done
+grep -q 'watchdog_start' "$sh" || ko "chien de garde absent"
+ok "sortie garantie : TERM/HUP/chien de garde laissent un verdict= dans le log"
+
+# status : lecture seule d'un run, pour ne pas dormir sur un log figé.
+: > "$tmp/view.count"
+st=$(MOCK_MODE=done MOCK_COUNT="$tmp/view.count" EMU_E2E_GH="$tmp/mock-gh-wait" OC_BRANCH=feat/multistop-e2e-2026-11-15 "$sh" status 55 2>&1)
+[ "$st" = "status=completed conclusion=success run=55" ] || ko "status : sortie inattendue : $st"
+set +e
+OC_BRANCH=x EMU_E2E_GH="$tmp/mock-gh-wait" "$sh" status '55; id' >/dev/null 2>&1; bad_rc=$?
+OC_BRANCH=x MOCK_MODE=broken MOCK_COUNT="$tmp/view.count" EMU_E2E_GH="$tmp/mock-gh-wait" "$sh" status 55 >/dev/null 2>&1; unread_rc=$?
+set -e
+[ "$bad_rc" -ne 0 ] || ko "status doit refuser un identifiant non numérique"
+[ "$unread_rc" -eq 1 ] || ko "status illisible : rc=$unread_rc (attendu 1)"
+grep -q 'emu-e2e.sh status \*' "$wf" || ko "sudoers : status absent de la liste autorisée"
+ok "status : lecture seule, id numérique, illisible → rc 1, autorisé via sudoers"
+
+# Prompt : lancement détaché sans sous-shell, et règle des 2 cycles sur log figé.
+blk=$("$sh" prompt-block)
+printf '%s' "$blk" | grep -q 'setsid nohup' || ko "prompt sans lancement détaché (setsid nohup)"
+printf '%s' "$blk" | grep -qF 'A && B && nohup' || ko "prompt sans l'interdiction du sous-shell A && B && nohup"
+printf '%s' "$blk" | grep -q 'plus de 2 cycles' || ko "prompt sans la règle des 2 cycles"
+printf '%s' "$blk" | grep -q 'emu-e2e.sh status <run_id>' || ko "prompt sans la vérification d'état du run"
+ok "prompt : lancement détaché et vérification d'état après 2 cycles sans mouvement"
+
 # --- 4. workflow : input booléen, plus de setup local, gardes intactes --------
 grep -q 'with_emulators:' "$wf" || ko "input with_emulators absent du workflow"
 awk '
