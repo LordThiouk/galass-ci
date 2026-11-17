@@ -436,7 +436,8 @@ jobs:
             "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" "$CI_DIR/opencode/checkpoint.sh" \
             "$CI_DIR/opencode/extra-repos.sh" "$CI_DIR/opencode/emu-e2e.sh" "$T/"
           # Sourcé par extra-repos.sh, wippush.sh et livelog.sh depuis $T (pas le cwd).
-          sudo install -o root -g root -m 0644 "$CI_DIR/opencode/allowed-repos.sh" "$CI_DIR/opencode/log-recipient.txt" "$T/"
+          sudo install -o root -g root -m 0644 "$CI_DIR/opencode/allowed-repos.sh" "$CI_DIR/opencode/log-recipient.txt" "$CI_DIR/opencode/autosave-deny.txt" "$T/"
+          sudo install -o root -g root -m 0755 "$CI_DIR/opencode/autosave.sh" "$T/"
           rm -rf "$RUNNER_TEMP/gl" "$f"
           # Config gitleaks du dépôt cible au SHA de départ (même règle que le contrôle avant push).
           cd "$TARGET_DIR"
@@ -555,6 +556,7 @@ jobs:
               WIP_REMOTE="$TARGET_GIT" \
               WIP_BASE_SHA="$BASE_SHA" WIP_GITLEAKS="$T/gitleaks" WIP_GL_CONFIG="$gcfg" \
               WIP_GL_IGNORE="$T/gitleaks-ignore" WIP_ISA_KEY_FILE=/opt/fullrun-live/isa.key WIP_TOKEN_STDIN=1 \
+              WIP_AUTOSAVE_DENY="$T/autosave-deny.txt" \
               IN_WIP_PUSH_MIN="$IN_WIP_PUSH_MIN" \
               setsid -f nice -n 0 "$T/wippush.sh" daemon > "$RUNNER_TEMP/wip.out" 2>&1 &
             ok=0
@@ -600,7 +602,7 @@ jobs:
                 WIP_REMOTE="https://github.com/LordThiouk/${r}.git" \
                 WIP_BASE_SHA="$b" WIP_GITLEAKS="$T/gitleaks" WIP_GL_CONFIG="$gcfg" \
                 WIP_GL_IGNORE="$T/gitleaks-ignore" WIP_ISA_KEY_FILE=/opt/fullrun-live/isa.key \
-                WIP_TOKEN_STDIN=1 IN_WIP_PUSH_MIN="$IN_WIP_PUSH_MIN" \
+                WIP_TOKEN_STDIN=1 IN_WIP_PUSH_MIN="$IN_WIP_PUSH_MIN" WIP_AUTOSAVE_DENY="$T/autosave-deny.txt" \
                 setsid -f nice -n 0 "$T/wippush.sh" daemon > "$RUNNER_TEMP/wip-extra-$r.out" 2>&1 &
               okx=0
               for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -754,7 +756,7 @@ jobs:
           cd "$TARGET_DIR"
           # Outils figés avant opencode (root) : gitleaks, masquage, chiffrement, destinataire age.
           T=/opt/fullrun-tools; L=/opt/fullrun-live
-          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh checkpoint.sh extra-repos.sh emu-e2e.sh allowed-repos.sh log-recipient.txt; do
+          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh checkpoint.sh autosave.sh autosave-deny.txt extra-repos.sh emu-e2e.sh allowed-repos.sh log-recipient.txt; do
             [ -f "$T/$tool" ] || { echo "::error::outil figé absent ($tool) : push refusé"; exit 1; }
           done
           # Artefact chiffré (journal + rapport gitleaks) : publié seulement si un contrôle refuse.
