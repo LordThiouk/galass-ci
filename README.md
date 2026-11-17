@@ -74,6 +74,7 @@ Onglet Actions → `opencode FullRun` → `Run workflow` :
 | `isa_path` | `MEMORY/WORK/<dossier>/ISA.md`, ou vide (déduite du prompt). |
 | `base_branch` | Cible de la PR en brouillon (vide = branche par défaut du dépôt concerné). |
 | `idle_minutes` / `wip_push_minutes` | Silence max et rythme de push des wip (dépôt cible). |
+| `agent_idle_minutes` | Silence max **par agent**, ex. `Forge=40,Max=30` (1 à 720 min ; vide = défaut `Forge=40`). Plus long que `idle_minutes` : l'agent en cours garde sa tâche jusqu'à ce seuil ; les autres gardent `idle_minutes` ; jamais plus court ; un `OC_SUBAGENT_IDLE_SEC` explicite reste maître ; valeur invalide : refus. |
 | `with_emulators` | Défaut `false`. Si `true`, opencode reçoit l'outil figé `/opt/fullrun-tools/emu-e2e.sh`, qui déclenche `artemis-staging-e2e.yml` sur `LordThiouk/galass-emu-actions-pub` (les secrets e2e restent dans ce dépôt : rien à poser sur galass-ci), avec `rider_ref`/`driver_ref` = la branche de travail du FullRun si elle existe sur le dépôt, sinon `main`. L'outil attend la fin (délai borné), rend le verdict et, en échec, un court extrait des logs. opencode peut corriger et relancer en boucle. Le jeton utilisé est `GALASS_TOKEN` (hors de l'environnement d'opencode). Pas de FreeLLM : les modèles FullRun restent `opencode/*-free` ; Artemis côté emu reçoit `deepseek-v4.1-flash-free`. Prérequis : [PR emu #5](https://github.com/LordThiouk/galass-emu-actions-pub/pull/5) (API opencode `*-free`, risque 403) et le droit Actions write du jeton sur le dépôt emu. |
 
 Ou en CLI :
