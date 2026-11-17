@@ -30,6 +30,10 @@ Tu tournes sur un runner GitHub Actions public, pas sur la box. Suis le FullRun.
   `bash /opt/fullrun-tools/checkpoint.sh verdict --job $OC_JOB --agent Max`. Ce second appel est
   refusé si le verdict ne vient pas d'une vraie réponse du sous-agent : un PASS écrit par toi n'est
   jamais un verdict.
+- **Sauvegarde automatique.** Un démon (hors opencode) commite localement, avant chaque push de wip :
+  le report ISA et le point de reprise (`wip(carry)`), puis l'arbre de code filtré (`wip(autosave)`).
+  Ces commits sont normaux : ne les défais pas, ne les prends pas pour une clôture. `.env`, clés et keystores,
+  `google-services`, comptes de service, secrets PSP, builds et dépendances n'y entrent jamais ; un fichier qui fuit selon gitleaks reste non commité.
 - Modèles : principal et Forge `$OC_MODEL_MAIN`, Max `$OC_MODEL_MAX` (gratuits opencode).
 - Pas de VPS, pas de FreeLLM, pas de Mac. Pas de merge, pas de déploiement.
 
