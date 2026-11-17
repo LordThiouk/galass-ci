@@ -225,6 +225,87 @@ set -e
 printf '%s' "$out" | grep -q 'verdict=timeout' || ko "verdict timeout manquant : $out"
 ok "run : timeout borné (124)"
 
+# --- 3b. attente : sortie dès que le run est terminé, bornée, tolérante -------
+# Mock paramétré par MOCK_MODE : done | hang | flaky | broken. Les appels
+# `run view` sont comptés dans $MOCK_COUNT.
+cat > "$tmp/mock-gh-wait" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  api)
+    path=""
+    for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
+    case "$path" in repos/LordThiouk/*/branches/*) exit 0 ;; *) exit 1 ;; esac
+    ;;
+  workflow) exit 0 ;;
+  run)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      list)
+        printf '%s\n' '[{"databaseId":55,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"https://example.test/55"}]'
+        ;;
+      view)
+        if printf '%s\n' "$*" | grep -q -- '--log-failed'; then exit 0; fi
+        n=$(( $(cat "${MOCK_COUNT:?}" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$n" > "$MOCK_COUNT"
+        case "${MOCK_MODE:?}" in
+          done)   printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/55","displayTitle":"e2e"}' ;;
+          hang)   sleep 30; printf '%s\n' '{"status":"in_progress","conclusion":"","url":"u","displayTitle":"e2e"}' ;;
+          flaky)
+            if [ "$n" -le 2 ]; then exit 1; fi
+            printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/55","displayTitle":"e2e"}'
+            ;;
+          broken) exit 1 ;;
+        esac
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+MOCK
+chmod +x "$tmp/mock-gh-wait"
+wait_run() { # $1=mode, reste = variables d'environnement supplémentaires
+  local mode="$1"; shift
+  : > "$tmp/view.count"
+  start=$SECONDS
+  set +e
+  wait_out=$(env "$@" MOCK_MODE="$mode" MOCK_COUNT="$tmp/view.count" EMU_E2E_GH="$tmp/mock-gh-wait" "$sh" run 2>&1)
+  wait_rc=$?
+  set -e
+  wait_elapsed=$(( SECONDS - start ))
+  wait_views=$(cat "$tmp/view.count" 2>/dev/null || echo 0)
+}
+
+# Run déjà terminé : une seule lecture, aucune pause, malgré un délai de 600 s et un sondage de 30 s.
+wait_run done EMU_E2E_TIMEOUT_SEC=600 EMU_E2E_POLL_SEC=30
+[ "$wait_rc" -eq 0 ] || ko "run déjà terminé : rc=$wait_rc (attendu 0) : $wait_out"
+printf '%s' "$wait_out" | grep -q 'verdict=success' || ko "run déjà terminé : verdict manquant : $wait_out"
+[ "$wait_views" -eq 1 ] || ko "run déjà terminé : $wait_views lectures (attendu 1, aucune attente)"
+[ "$wait_elapsed" -lt 10 ] || ko "run déjà terminé : ${wait_elapsed}s (doit sortir immédiatement)"
+ok "attente : run déjà terminé → sortie immédiate (1 lecture, ${wait_elapsed}s)"
+
+# Appel gh qui pend : plafonné par appel, l'attente reste bornée (124).
+wait_run hang EMU_E2E_TIMEOUT_SEC=4 EMU_E2E_POLL_SEC=0 EMU_E2E_GH_TIMEOUT_SEC=1
+[ "$wait_rc" -eq 124 ] || ko "gh qui pend : rc=$wait_rc (attendu 124) : $wait_out"
+printf '%s' "$wait_out" | grep -q 'verdict=timeout' || ko "gh qui pend : verdict timeout manquant"
+[ "$wait_elapsed" -lt 20 ] || ko "gh qui pend : ${wait_elapsed}s, l'attente n'est pas bornée"
+ok "attente : appel gh qui pend → borné (${wait_elapsed}s, rc 124)"
+
+# Erreurs transitoires de lecture : tolérées puis résolues.
+wait_run flaky EMU_E2E_TIMEOUT_SEC=60 EMU_E2E_POLL_SEC=0
+[ "$wait_rc" -eq 0 ] || ko "lectures instables : rc=$wait_rc (attendu 0) : $wait_out"
+[ "$wait_views" -eq 3 ] || ko "lectures instables : $wait_views lectures (attendu 3)"
+ok "attente : 2 erreurs de lecture transitoires tolérées, puis verdict"
+
+# Lecture définitivement cassée : abandon après MAX_VIEW_FAILS, pas de boucle infinie.
+wait_run broken EMU_E2E_TIMEOUT_SEC=600 EMU_E2E_POLL_SEC=0
+[ "$wait_rc" -eq 1 ] || ko "lecture cassée : rc=$wait_rc (attendu 1) : $wait_out"
+printf '%s' "$wait_out" | grep -q 'impossible de lire le run' || ko "lecture cassée : message manquant : $wait_out"
+[ "$wait_views" -le 5 ] || ko "lecture cassée : $wait_views lectures (max 5)"
+ok "attente : lecture cassée → abandon après ${wait_views} échecs consécutifs"
+
 # --- 4. workflow : input booléen, plus de setup local, gardes intactes --------
 grep -q 'with_emulators:' "$wf" || ko "input with_emulators absent du workflow"
 awk '

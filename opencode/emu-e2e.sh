@@ -28,6 +28,10 @@ DEFAULT_TIMEOUT_SEC=10800
 DEFAULT_POLL_SEC=30
 DEFAULT_LOG_TAIL=80
 DEFAULT_LOG_WIDTH=300
+# Plafond par appel gh : un appel réseau qui pend ne doit jamais bloquer la boucle d'attente.
+DEFAULT_GH_TIMEOUT_SEC=60
+# Lectures consécutives du run en échec avant d'abandonner (erreurs transitoires tolérées).
+MAX_VIEW_FAILS=5
 FALLBACK_REF="main"
 
 fail() { echo "$1" >&2; exit 1; }
@@ -62,6 +66,7 @@ load_file_vars() {
       EMU_E2E_POLL_SEC) EMU_E2E_POLL_SEC="$v" ;;
       EMU_LOG_TAIL) EMU_LOG_TAIL="$v" ;;
       EMU_LOG_WIDTH) EMU_LOG_WIDTH="$v" ;;
+      EMU_E2E_GH_TIMEOUT_SEC) EMU_E2E_GH_TIMEOUT_SEC="$v" ;;
       *) ;;
     esac
   done < "$f"
@@ -76,12 +81,14 @@ load_config() {
   EMU_E2E_POLL_SEC="${EMU_E2E_POLL_SEC:-$DEFAULT_POLL_SEC}"
   EMU_LOG_TAIL="${EMU_LOG_TAIL:-$DEFAULT_LOG_TAIL}"
   EMU_LOG_WIDTH="${EMU_LOG_WIDTH:-$DEFAULT_LOG_WIDTH}"
+  EMU_E2E_GH_TIMEOUT_SEC="${EMU_E2E_GH_TIMEOUT_SEC:-$DEFAULT_GH_TIMEOUT_SEC}"
   if [ "$(id -u)" -eq 0 ] && [ -f "$CANON_STATE" ]; then
     OC_BRANCH=""; EMU_E2E_MODEL="$DEFAULT_MODEL"
     EMU_E2E_TIMEOUT_SEC="$DEFAULT_TIMEOUT_SEC"
     EMU_E2E_POLL_SEC="$DEFAULT_POLL_SEC"
     EMU_LOG_TAIL="$DEFAULT_LOG_TAIL"
     EMU_LOG_WIDTH="$DEFAULT_LOG_WIDTH"
+    EMU_E2E_GH_TIMEOUT_SEC="$DEFAULT_GH_TIMEOUT_SEC"
     load_file_vars "$CANON_STATE"
   elif [ -n "${EMU_E2E_STATE:-}" ] && [ -f "$EMU_E2E_STATE" ]; then
     load_file_vars "$EMU_E2E_STATE"
@@ -90,6 +97,10 @@ load_config() {
   [[ "${EMU_E2E_POLL_SEC}" =~ ^[0-9]+$ ]] || fail "intervalle de sondage invalide"
   [[ "${EMU_LOG_TAIL}" =~ ^[0-9]+$ ]] || fail "taille d'extrait invalide"
   [[ "${EMU_LOG_WIDTH}" =~ ^[0-9]+$ ]] || fail "largeur d'extrait invalide"
+  [[ "${EMU_E2E_GH_TIMEOUT_SEC}" =~ ^[0-9]+$ ]] || fail "timeout d'appel gh invalide"
+  if [ "$EMU_E2E_GH_TIMEOUT_SEC" -lt 1 ] || [ "$EMU_E2E_GH_TIMEOUT_SEC" -gt 600 ]; then
+    fail "timeout d'appel gh hors bornes (1-600)"
+  fi
   [ "$EMU_E2E_TIMEOUT_SEC" -ge 1 ] || fail "timeout invalide"
   [ "$EMU_E2E_POLL_SEC" -ge 0 ] || fail "intervalle de sondage invalide"
   if [ "$EMU_LOG_TAIL" -lt 1 ] || [ "$EMU_LOG_TAIL" -gt 200 ]; then
@@ -146,10 +157,9 @@ urlenc() {
 }
 
 branch_exists() {
-  local repo="$1" ref="$2" enc gh
-  gh=$(gh_bin)
+  local repo="$1" ref="$2" enc
   enc=$(urlenc "$ref")
-  GH_TOKEN="$token" GH_PROMPT_DISABLED=1 "$gh" api --silent "repos/${EMU_OWNER}/${repo}/branches/${enc}"
+  gh_cmd api --silent "repos/${EMU_OWNER}/${repo}/branches/${enc}"
 }
 
 resolve_one() {
@@ -249,7 +259,12 @@ if out:
 gh_cmd() {
   local gh
   gh=$(gh_bin)
-  GH_TOKEN="$token" GH_PROMPT_DISABLED=1 "$gh" "$@"
+  # Chaque appel est plafonné (timeout → rc 124) : un gh qui pend ne bloque jamais l'attente.
+  if command -v timeout >/dev/null 2>&1; then
+    GH_TOKEN="$token" GH_PROMPT_DISABLED=1 timeout "${EMU_E2E_GH_TIMEOUT_SEC:-$DEFAULT_GH_TIMEOUT_SEC}" "$gh" "$@"
+  else
+    GH_TOKEN="$token" GH_PROMPT_DISABLED=1 "$gh" "$@"
+  fi
 }
 
 find_new_run() {
@@ -312,25 +327,40 @@ run_e2e() {
   [ -n "$run_id" ] || fail "aucun run e2e trouvé avant le délai (déclenchement peut-être refusé)"
   echo "run=${run_id} https://github.com/${EMU_REPO}/actions/runs/${run_id}"
 
+  # Attente bornée de l'état du run : on sort dès que status=completed (ou qu'une
+  # conclusion existe), sans dormir de plus. Trois bornes indépendantes : l'échéance
+  # horloge, un nombre maximal de lectures, et MAX_VIEW_FAILS lectures consécutives en
+  # échec (les erreurs transitoires sont tolérées, pas indéfiniment).
   status=""
   conclusion=""
   url=""
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    view=$(view_run "$run_id") || fail "impossible de lire le run ${run_id}"
-    eval "$(python3 -c '
+  local polls=0 view_fails=0 poll_step max_polls
+  poll_step="$EMU_E2E_POLL_SEC"
+  [ "$poll_step" -ge 1 ] || poll_step=1
+  max_polls=$(( EMU_E2E_TIMEOUT_SEC / poll_step + 5 ))
+  while [ "$(date +%s)" -lt "$deadline" ] && [ "$polls" -lt "$max_polls" ]; do
+    polls=$(( polls + 1 ))
+    if view=$(view_run "$run_id" 2>/dev/null); then
+      view_fails=0
+      eval "$(python3 -c '
 import json,sys,shlex
 d=json.loads(sys.argv[1])
 for k in ("status","conclusion","url"):
     print("s_%s=%s" % (k, shlex.quote(str(d.get(k) or ""))))
 ' "$view")"
-    status="$s_status"
-    conclusion="$s_conclusion"
-    url="$s_url"
-    case "$status" in
-      completed|cancelled) break ;;
-    esac
-    [ "$EMU_E2E_POLL_SEC" -gt 0 ] && sleep "$EMU_E2E_POLL_SEC"
-    [ "$EMU_E2E_POLL_SEC" -eq 0 ] && sleep 1
+      status="$s_status"
+      conclusion="$s_conclusion"
+      url="$s_url"
+      if [ "$status" = "completed" ] || [ "$status" = "cancelled" ] || [ -n "$conclusion" ]; then
+        [ "$status" = "completed" ] || status="completed"
+        break
+      fi
+    else
+      view_fails=$(( view_fails + 1 ))
+      [ "$view_fails" -lt "$MAX_VIEW_FAILS" ] \
+        || fail "impossible de lire le run ${run_id} (${view_fails} échecs consécutifs)"
+    fi
+    sleep "$poll_step"
   done
 
   if [ "$status" != "completed" ] && [ "$status" != "cancelled" ]; then
