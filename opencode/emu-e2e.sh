@@ -422,12 +422,13 @@ run_e2e() {
   RUN_ID_CUR="$run_id"
   echo "run=${run_id} https://github.com/${EMU_REPO}/actions/runs/${run_id}"
 
-  # Garde de sécurité, en plus du filtre de find_new_run : même le run choisi est revérifié avant
-  # de laisser son verdict se lire comme un test. Jamais un faux FAIL de test : le message nomme
-  # explicitement la cause (« mauvais ref »). Pas d'appel gh supplémentaire ici : headBranch vient
-  # du `run list` déjà fait dans find_new_run — un second appel `run view` ajouterait une lecture
-  # non comptée aux scénarios d'attente déjà calibrés plus bas (done=1, flaky=3, broken<=5), sans
-  # couvrir un cas de divergence API list/view plus rare que celui, avéré, que ce filtre corrige.
+  # Première garde, bon marché (aucun appel gh : headBranch vient du `run list` déjà fait
+  # dans find_new_run) : le run choisi est revérifié avant de laisser son verdict se lire
+  # comme un test. Jamais un faux FAIL de test : le message nomme explicitement la cause
+  # (« mauvais ref »). Elle ne suffit pas seule : `run list` et `run view` peuvent diverger
+  # (API en retard, run réutilisé) — c'est pourquoi la boucle d'attente plus bas revérifie
+  # aussi le head_branch sur chaque lecture via `run view`, sans appel gh supplémentaire ni
+  # changement des bornes déjà calibrées (done/flaky/broken).
   if [ -z "$run_branch" ] || [ "$run_branch" != "$emu_ref" ]; then
     echo "verdict=FAIL ref_erronee run=${run_id} attendu=${emu_ref} obtenu=${run_branch:-?}"
     fail "mauvais ref : run ${run_id} déclenché sur head_branch=${run_branch:-?} au lieu de ${emu_ref} (jamais lu comme un échec de test)"
@@ -451,12 +452,27 @@ run_e2e() {
       eval "$(python3 -c '
 import json,sys,shlex
 d=json.loads(sys.argv[1])
-for k in ("status","conclusion","url"):
-    print("s_%s=%s" % (k, shlex.quote(str(d.get(k) or ""))))
+for k in ("status","conclusion","url","headBranch"):
+    print("s_%s=%s" % (k.lower(), shlex.quote(str(d.get(k) or ""))))
 ' "$view")"
       status="$s_status"
       conclusion="$s_conclusion"
       url="$s_url"
+      # Régression (revue) : find_new_run filtre par headBranch via `run list`, mais `run
+      # list` et `run view` peuvent diverger (API en retard, run réutilisé) — la fusion avec
+      # main avait retiré la revérification indépendante du head_branch via `run view` que
+      # PR #11 ajoutait, en se fiant seulement à `run list`. Preuve du retrait : avec un faux
+      # gh où list=feat/multi mais view=main, l'ancien code lisait « e2e : succès » (rc=0).
+      # On revérifie ici sur CHAQUE lecture réussie (le head_branch d'un run ne change pas
+      # pendant sa vie, donc la première lecture suffit à trancher) — sans appel gh
+      # supplémentaire ni modification des bornes d'attente (deadline/max_polls/MAX_VIEW_FAILS
+      # inchangées), pour ne pas rouvrir les comptages déjà calibrés des scénarios done/
+      # flaky/broken juste au-dessous. Un headBranch absent (API qui ne le renverrait pas)
+      # n'est pas traité comme une erreur : seule une divergence avérée doit FAIL.
+      if [ -n "$s_headbranch" ] && [ "$s_headbranch" != "$emu_ref" ]; then
+        echo "verdict=FAIL ref_erronee run=${run_id} attendu=${emu_ref} obtenu=${s_headbranch}"
+        fail "mauvais ref : run ${run_id} sur head_branch=${s_headbranch} (attendu ${emu_ref}) — divergence list/view, jamais lu comme un succès de test"
+      fi
       echo "$(date -u +%H:%M:%S) sondage ${polls}/${max_polls} (+$(( $(date +%s) - t_start ))s) run=${run_id} status=${status:-?} conclusion=${conclusion:--}"
       if [ "$status" = "completed" ] || [ "$status" = "cancelled" ] || [ -n "$conclusion" ]; then
         [ "$status" = "completed" ] || status="completed"

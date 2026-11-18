@@ -511,4 +511,42 @@ ref_run has "$two_runs"
 printf '%s' "$refrun_out" | grep -q 'run=201' || ko "filtre find_new_run : aurait dû choisir le run 201 (bonne branche), pas 200 : $refrun_out"
 ok "find_new_run filtre sur headBranch : le run de la bonne branche est choisi, pas le plus récent au hasard"
 
+# --- (5) régression : divergence list/view sur le head_branch (repris de main, dbe68be) ---
+# `run list` (consulté par find_new_run) annonce la bonne branche, donc passe le filtre et la
+# première garde (bon marché, l.~425) ; mais la vue détaillée (`run view`) du MÊME run révèle une
+# autre branche : API en retard, run réutilisé par accident. Avant ce correctif, seule la liste
+# était jamais consultée : ce scénario était lu comme « e2e : succès » (rc=0), silencieusement.
+cat > "$tmp/mock-gh-wrongref" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  api)
+    path=""
+    for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
+    case "$path" in repos/LordThiouk/*/branches/*) exit 0 ;; *) exit 1 ;; esac
+    ;;
+  workflow) [ "${1:-}" = run ] || exit 2; exit 0 ;;
+  run)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      list) printf '%s\n' '[{"databaseId":6001,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"https://example.test/6001","headBranch":"feat/multi"}]' ;;
+      view) printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/6001","displayTitle":"e2e","headBranch":"main"}' ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+MOCK
+chmod +x "$tmp/mock-gh-wrongref"
+set +e
+wrongref_out=$(EMU_E2E_GH="$tmp/mock-gh-wrongref" OC_BRANCH="feat/multi" EMU_E2E_TIMEOUT_SEC=5 EMU_E2E_POLL_SEC=0 "$sh" run 2>&1)
+wrongref_rc=$?
+set -e
+[ "$wrongref_rc" -ne 0 ] || ko "divergence list/view : rc=0 (attendu différent de 0) : $wrongref_out"
+printf '%s' "$wrongref_out" | grep -qi 'mauvais ref' || ko "divergence list/view : message « mauvais ref » absent : $wrongref_out"
+printf '%s' "$wrongref_out" | grep -q 'ref_erronee' || ko "divergence list/view : jeton verdict=FAIL ref_erronee absent : $wrongref_out"
+printf '%s' "$wrongref_out" | grep -q 'e2e : succès' && ko "divergence list/view : lue à tort comme un succès de test (régression exacte signalée) : $wrongref_out"
+ok "régression : list=feat/multi mais view=main (run réutilisé/API en retard) → FAIL mauvais ref/ref_erronee, jamais lu comme un succès"
+
 echo "tous les contrôles with_emulators sont passés"
