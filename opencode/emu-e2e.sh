@@ -166,13 +166,21 @@ resolve_refs() {
   read_token
   rider_ref=$(resolve_one "$RIDER_REPO")
   driver_ref=$(resolve_one "$DRIVER_REPO")
+  # emu_ref : branche de galass-emu-actions-pub lui-même (le harnais e2e), pas
+  # seulement Rider/Driver — revue : sans elle, `gh workflow run` tournait toujours
+  # sur le harnais de main, même quand la branche de travail le modifiait.
+  emu_ref=$(resolve_one "$EMU_REPO_NAME")
   echo "rider_ref=${rider_ref}"
   echo "driver_ref=${driver_ref}"
+  echo "emu_ref=${emu_ref}"
   if [ "$rider_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
     echo "note : ${RIDER_REPO} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
   fi
   if [ "$driver_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
     echo "note : ${DRIVER_REPO} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
+  fi
+  if [ "$emu_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
+    echo "note : ${EMU_REPO_NAME} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
   fi
 }
 
@@ -253,24 +261,27 @@ gh_cmd() {
 }
 
 find_new_run() {
-  local since="$1" json
+  # ref : filtre obligatoire par branche (revue). Sans lui, un run plus récent
+  # mais déclenché sur une autre branche (ex. main, par un autre job) passerait
+  # avant le bon run — même dans la fenêtre "since".
+  local since="$1" ref="$2" json
   json=$(gh_cmd run list -R "$EMU_REPO" --workflow="$EMU_WORKFLOW" \
     --event=workflow_dispatch --limit 10 \
-    --json databaseId,createdAt,status,conclusion,url) || return 1
+    --json databaseId,createdAt,status,conclusion,url,headBranch) || return 1
   python3 -c '
 import json,sys
-since=sys.argv[1]
-rows=json.loads(sys.argv[2])
-cands=[r for r in rows if (r.get("createdAt") or "") >= since]
+since, ref = sys.argv[1], sys.argv[2]
+rows=json.loads(sys.argv[3])
+cands=[r for r in rows if (r.get("createdAt") or "") >= since and (r.get("headBranch") or "") == ref]
 if not cands:
     sys.exit(2)
 cands.sort(key=lambda r: r.get("createdAt") or "", reverse=True)
 print(cands[0]["databaseId"])
-' "$since" "$json"
+' "$since" "$ref" "$json"
 }
 
 view_run() {
-  gh_cmd run view "$1" -R "$EMU_REPO" --json status,conclusion,url,displayTitle
+  gh_cmd run view "$1" -R "$EMU_REPO" --json status,conclusion,url,displayTitle,headBranch
 }
 
 run_e2e() {
@@ -283,17 +294,25 @@ run_e2e() {
   read_token
   rider_ref=$(resolve_one "$RIDER_REPO")
   driver_ref=$(resolve_one "$DRIVER_REPO")
+  # emu_ref : branche du harnais lui-même. Sans --ref, `gh workflow run` exécute
+  # TOUJOURS la version du workflow sur la branche par défaut (main) du dépôt
+  # emu — jamais celle de la branche de travail, même si rider_ref/driver_ref
+  # pointent dessus (revue : l.361, chaque e2e tournait sur le harnais de main).
+  emu_ref=$(resolve_one "$EMU_REPO_NAME")
   echo "déclenchement : $EMU_REPO $EMU_WORKFLOW"
-  echo "rider_ref=${rider_ref} driver_ref=${driver_ref} model=${EMU_E2E_MODEL}"
+  echo "rider_ref=${rider_ref} driver_ref=${driver_ref} emu_ref=${emu_ref} model=${EMU_E2E_MODEL}"
   if [ "$rider_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
     echo "note : ${RIDER_REPO} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
   fi
   if [ "$driver_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
     echo "note : ${DRIVER_REPO} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
   fi
+  if [ "$emu_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
+    echo "note : ${EMU_REPO_NAME} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
+  fi
 
   since=$(iso_minus 15)
-  if ! gh_cmd workflow run "$EMU_WORKFLOW" -R "$EMU_REPO" \
+  if ! gh_cmd workflow run "$EMU_WORKFLOW" -R "$EMU_REPO" --ref "$emu_ref" \
       -f "rider_ref=${rider_ref}" -f "driver_ref=${driver_ref}" \
       -f "model=${EMU_E2E_MODEL}"; then
     fail "échec du déclenchement : le jeton GALASS_TOKEN a-t-il le droit actions:write sur ${EMU_REPO} ?"
@@ -302,15 +321,26 @@ run_e2e() {
   deadline=$(( $(date +%s) + EMU_E2E_TIMEOUT_SEC ))
   run_id=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if run_id=$(find_new_run "$since" 2>/dev/null); then
+    # find_new_run filtre désormais par branche (emu_ref) : un run plus récent
+    # mais sur une autre branche (ex. un autre job sur main) ne doit jamais être
+    # pris pour celui qu'on vient de déclencher.
+    if run_id=$(find_new_run "$since" "$emu_ref" 2>/dev/null); then
       [ -n "$run_id" ] && break
     fi
     run_id=""
     [ "$EMU_E2E_POLL_SEC" -gt 0 ] && sleep "$EMU_E2E_POLL_SEC"
     [ "$EMU_E2E_POLL_SEC" -eq 0 ] && sleep 1
   done
-  [ -n "$run_id" ] || fail "aucun run e2e trouvé avant le délai (déclenchement peut-être refusé)"
+  [ -n "$run_id" ] || fail "aucun run e2e trouvé avant le délai sur la branche ${emu_ref} (déclenchement peut-être refusé ou mauvais ref)"
   echo "run=${run_id} https://github.com/${EMU_REPO}/actions/runs/${run_id}"
+
+  # Garde-fou supplémentaire (revue) : même après le filtre de find_new_run, on
+  # revérifie le head_branch du run RETENU avant d'en attendre le verdict.
+  # Jamais de silence sur un mauvais ref (ex. API en retard, run réutilisé).
+  view0=$(view_run "$run_id") || fail "impossible de lire le run ${run_id}"
+  head_branch=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("headBranch") or "")' "$view0")
+  [ "$head_branch" = "$emu_ref" ] \
+    || fail "mauvais ref : run ${run_id} sur head_branch=${head_branch:-?} (attendu ${emu_ref})"
 
   status=""
   conclusion=""

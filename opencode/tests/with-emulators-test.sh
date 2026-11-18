@@ -76,7 +76,7 @@ case "$cmd" in
     case "$sub" in
       list)
         # Un run créé juste après le since du script.
-        printf '%s\n' '[{"databaseId":4242,"createdAt":"2099-01-01T00:00:00Z","status":"in_progress","conclusion":"","url":"https://example.test/4242"}]'
+        printf '%s\n' '[{"databaseId":4242,"createdAt":"2099-01-01T00:00:00Z","status":"in_progress","conclusion":"","url":"https://example.test/4242","headBranch":"main"}]'
         ;;
       view)
         id="${1:-}"
@@ -92,7 +92,7 @@ case "$cmd" in
             i=$((i + 1))
           done
         else
-          printf '%s\n' '{"status":"completed","conclusion":"failure","url":"https://example.test/4242","displayTitle":"e2e"}'
+          printf '%s\n' '{"status":"completed","conclusion":"failure","url":"https://example.test/4242","displayTitle":"e2e","headBranch":"main"}'
         fi
         ;;
       *) exit 2 ;;
@@ -121,6 +121,15 @@ printf '%s\n' "$refs" | grep -qx 'driver_ref=main' || ko "driver_ref devrait ret
 printf '%s\n' "$refs" | grep -q 'Galass_Driver' || ko "resolve-refs doit signaler le fallback Driver"
 printf '%s\n' "$refs" | grep -Fq "$tok" && ko "jeton fuité dans resolve-refs"
 ok "resolve-refs : branche de travail ou main, sans fuite"
+
+# --- 3b. emu_ref (revue : galass-ci opencode/emu-e2e.sh l.361, --ref manquant) -
+# Le mock ci-dessus (api repos/*/branches/feat%2Fmulti) ne connaît QUE Rider ;
+# galass-emu-actions-pub n'a pas la branche de travail → repli main, comme Driver.
+refs2=$(EMU_E2E_GH="$tmp/mock-gh" EMU_E2E_TOKEN_FILE="$tmp/token" OC_BRANCH="feat/multi" \
+  "$sh" resolve-refs)
+printf '%s\n' "$refs2" | grep -qx 'emu_ref=main' \
+  || ko "emu_ref devrait retomber sur main (galass-emu-actions-pub sans la branche), obtenu : $refs2"
+ok "resolve-refs : emu_ref résolu (branche de travail ou main)"
 
 # Modèle non opencode/*-free refusé (avant tout appel réseau).
 if out=$(EMU_E2E_MODEL=gemini-2.5-flash "$sh" run 2>&1); then
@@ -175,8 +184,8 @@ case "$cmd" in
   run)
     sub="${1:-}"
     case "$sub" in
-      list) printf '%s\n' '[{"databaseId":7,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"https://example.test/7"}]' ;;
-      view) printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/7","displayTitle":"e2e"}' ;;
+      list) printf '%s\n' '[{"databaseId":7,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"https://example.test/7","headBranch":"main"}]' ;;
+      view) printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/7","displayTitle":"e2e","headBranch":"main"}' ;;
       *) exit 2 ;;
     esac
     ;;
@@ -208,8 +217,8 @@ case "$cmd" in
   run)
     sub="${1:-}"
     case "$sub" in
-      list) printf '%s\n' '[{"databaseId":9,"createdAt":"2099-01-01T00:00:00Z","status":"in_progress","conclusion":"","url":"https://example.test/9"}]' ;;
-      view) printf '%s\n' '{"status":"in_progress","conclusion":"","url":"https://example.test/9","displayTitle":"e2e"}' ;;
+      list) printf '%s\n' '[{"databaseId":9,"createdAt":"2099-01-01T00:00:00Z","status":"in_progress","conclusion":"","url":"https://example.test/9","headBranch":"feat/multi"}]' ;;
+      view) printf '%s\n' '{"status":"in_progress","conclusion":"","url":"https://example.test/9","displayTitle":"e2e","headBranch":"feat/multi"}' ;;
       *) exit 2 ;;
     esac
     ;;
@@ -224,6 +233,106 @@ set -e
 [ "$rc" -eq 124 ] || ko "timeout devrait sortir 124, obtenu $rc : $out"
 printf '%s' "$out" | grep -q 'verdict=timeout' || ko "verdict timeout manquant : $out"
 ok "run : timeout borné (124)"
+
+# --- 3c. --ref du dispatch + filtre de find_new_run par branche (revue : ligne 361
+# déclenchait le workflow emu sans --ref, donc chaque e2e tournait sur le harnais de
+# main au lieu de la branche cible) ------------------------------------------------
+cat > "$tmp/mock-gh-ref" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${EMU_E2E_GH_LOG:?}"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  api)
+    path=""
+    for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
+    case "$path" in
+      repos/LordThiouk/Galass_Rider/branches/feat%2Fmulti) exit 0 ;;
+      repos/LordThiouk/Galass_Driver/branches/feat%2Fmulti) exit 0 ;;
+      repos/LordThiouk/galass-emu-actions-pub/branches/feat%2Fmulti) exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  workflow)
+    [ "${1:-}" = run ] || exit 2
+    printf '%s\n' "$*" >> "${EMU_E2E_GH_LOG}.dispatch"
+    exit 0
+    ;;
+  run)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      list)
+        # Deux runs dans la fenêtre « since » : un plus récent sur main (le harnais par
+        # défaut, à écarter), un plus ancien mais sur la vraie branche (celui à choisir).
+        # Sans le filtre par branche (headBranch), find_new_run prendrait le mauvais
+        # (le plus récent, sur main).
+        printf '%s\n' '[
+          {"databaseId":5001,"createdAt":"2099-01-01T00:00:02Z","status":"completed","conclusion":"success","url":"https://example.test/5001","headBranch":"main"},
+          {"databaseId":5002,"createdAt":"2099-01-01T00:00:01Z","status":"queued","conclusion":"","url":"https://example.test/5002","headBranch":"feat/multi"}
+        ]'
+        ;;
+      view)
+        id="${1:-}"
+        if printf '%s\n' "$*" | grep -q -- '--log-failed'; then
+          echo "(aucun échec attendu dans ce scénario)"
+        elif [ "$id" = 5002 ]; then
+          printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/5002","displayTitle":"e2e","headBranch":"feat/multi"}'
+        else
+          printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/5001","displayTitle":"e2e","headBranch":"main"}'
+        fi
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+MOCK
+chmod +x "$tmp/mock-gh-ref"
+: > "$tmp/gh.log"; : > "$tmp/gh.log.dispatch"
+out=$(EMU_E2E_GH="$tmp/mock-gh-ref" EMU_E2E_GH_LOG="$tmp/gh.log" OC_BRANCH="feat/multi" "$sh" run 2>&1) \
+  || ko "run (scénario --ref) aurait dû réussir : $out"
+grep -q -- '--ref feat/multi' "$tmp/gh.log.dispatch" \
+  || ko "le déclenchement doit passer --ref <emu_ref> (branche de travail de galass-emu-actions-pub), log : $(cat "$tmp/gh.log.dispatch")"
+printf '%s' "$out" | grep -q 'run=5002' \
+  || ko "find_new_run devrait choisir le run sur la bonne branche (5002), pas le plus récent sur main (5001) : $out"
+ok "run : --ref transmis au dispatch, find_new_run filtre par branche (pas juste le plus récent)"
+
+# --- 3d. head_branch du run trouvé vérifié : FAIL explicite « mauvais ref » si le
+# run retenu (par ailleurs le seul de la fenêtre) ne porte pas la branche attendue --
+cat > "$tmp/mock-gh-wrongref" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${EMU_E2E_GH_LOG:?}"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  api)
+    path=""
+    for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
+    case "$path" in repos/LordThiouk/*/branches/*) exit 0 ;; *) exit 1 ;; esac
+    ;;
+  workflow) [ "${1:-}" = run ] || exit 2; exit 0 ;;
+  run)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      # La liste annonce la bonne branche (passe le filtre), mais la vue détaillée du
+      # même run révèle une autre branche : cohérence API en retard / run réutilisé
+      # par accident. Doit échouer explicitement, jamais être traité en silence.
+      list) printf '%s\n' '[{"databaseId":6001,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"https://example.test/6001","headBranch":"feat/multi"}]' ;;
+      view) printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/6001","displayTitle":"e2e","headBranch":"main"}' ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+MOCK
+chmod +x "$tmp/mock-gh-wrongref"
+set +e
+out=$(EMU_E2E_GH="$tmp/mock-gh-wrongref" OC_BRANCH="feat/multi" "$sh" run 2>&1)
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || ko "run avec head_branch divergent aurait dû échouer, obtenu rc=0 : $out"
+printf '%s' "$out" | grep -qi 'mauvais ref' || ko "l'échec doit nommer explicitement « mauvais ref » : $out"
+ok "run : head_branch du run vérifié, FAIL explicite « mauvais ref » si divergent"
 
 # --- 4. workflow : input booléen, plus de setup local, gardes intactes --------
 grep -q 'with_emulators:' "$wf" || ko "input with_emulators absent du workflow"
