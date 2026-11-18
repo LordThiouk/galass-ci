@@ -93,7 +93,7 @@ case "$cmd" in
             i=$((i + 1))
           done
         else
-          printf '%s\n' '{"status":"completed","conclusion":"failure","url":"https://example.test/4242","displayTitle":"e2e"}'
+          printf '%s\n' '{"status":"completed","conclusion":"failure","url":"https://example.test/4242","displayTitle":"e2e","headBranch":"main"}'
         fi
         ;;
       *) exit 2 ;;
@@ -122,6 +122,15 @@ printf '%s\n' "$refs" | grep -qx 'driver_ref=main' || ko "driver_ref devrait ret
 printf '%s\n' "$refs" | grep -q 'Galass_Driver' || ko "resolve-refs doit signaler le fallback Driver"
 printf '%s\n' "$refs" | grep -Fq "$tok" && ko "jeton fuité dans resolve-refs"
 ok "resolve-refs : branche de travail ou main, sans fuite"
+
+# --- 3b. emu_ref (revue : galass-ci opencode/emu-e2e.sh l.361, --ref manquant) -
+# Le mock ci-dessus (api repos/*/branches/feat%2Fmulti) ne connaît QUE Rider ;
+# galass-emu-actions-pub n'a pas la branche de travail → repli main, comme Driver.
+refs2=$(EMU_E2E_GH="$tmp/mock-gh" EMU_E2E_TOKEN_FILE="$tmp/token" OC_BRANCH="feat/multi" \
+  "$sh" resolve-refs)
+printf '%s\n' "$refs2" | grep -qx 'emu_ref=main' \
+  || ko "emu_ref devrait retomber sur main (galass-emu-actions-pub sans la branche), obtenu : $refs2"
+ok "resolve-refs : emu_ref résolu (branche de travail ou main)"
 
 # Modèle non opencode/*-free refusé (avant tout appel réseau).
 if out=$(EMU_E2E_MODEL=gemini-2.5-flash "$sh" run 2>&1); then
@@ -177,7 +186,7 @@ case "$cmd" in
     sub="${1:-}"
     case "$sub" in
       list) printf '%s\n' '[{"databaseId":7,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"https://example.test/7","headBranch":"main"}]' ;;
-      view) printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/7","displayTitle":"e2e"}' ;;
+      view) printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/7","displayTitle":"e2e","headBranch":"main"}' ;;
       *) exit 2 ;;
     esac
     ;;
@@ -210,7 +219,7 @@ case "$cmd" in
     sub="${1:-}"
     case "$sub" in
       list) printf '%s\n' '[{"databaseId":9,"createdAt":"2099-01-01T00:00:00Z","status":"in_progress","conclusion":"","url":"https://example.test/9","headBranch":"feat/multi"}]' ;;
-      view) printf '%s\n' '{"status":"in_progress","conclusion":"","url":"https://example.test/9","displayTitle":"e2e"}' ;;
+      view) printf '%s\n' '{"status":"in_progress","conclusion":"","url":"https://example.test/9","displayTitle":"e2e","headBranch":"feat/multi"}' ;;
       *) exit 2 ;;
     esac
     ;;

@@ -179,6 +179,9 @@ resolve_refs() {
   read_token
   rider_ref=$(resolve_one "$RIDER_REPO")
   driver_ref=$(resolve_one "$DRIVER_REPO")
+  # emu_ref : branche de galass-emu-actions-pub lui-même (le harnais e2e), pas
+  # seulement Rider/Driver — revue : sans elle, `gh workflow run` tournait toujours
+  # sur le harnais de main, même quand la branche de travail le modifiait.
   emu_ref=$(resolve_one "$EMU_REPO_NAME")
   echo "rider_ref=${rider_ref}"
   echo "driver_ref=${driver_ref}"
@@ -290,8 +293,11 @@ find_new_run() {
   # mais qu'un run existe quand même dans la fenêtre (autre branche), on le retourne tout de même :
   # c'est exactement le scénario du bug d'origine (dispatch sans --ref -> run exécuté sur main), et
   # c'est à l'appelant (run_e2e) de le refuser nommément via la garde head_branch, jamais en silence
-  # par un simple timeout générique. Imprime deux lignes (id, headBranch du run choisi) : l'appelant
-  # revérifie la seconde sans refaire d'appel gh — même réponse de `run list` que celle filtrée ici.
+  # par un simple timeout générique (sinon, un filtre strict qui exclurait d'emblée tout run sur la
+  # mauvaise branche ne retrouverait jamais ce run, et on perdrait le message explicite « mauvais
+  # ref » au profit d'un timeout muet). Imprime deux lignes (id, headBranch du run choisi) :
+  # l'appelant revérifie la seconde sans refaire d'appel gh — même réponse de `run list` que celle
+  # filtrée ici.
   local since="$1" want_branch="$2" json
   json=$(gh_cmd run list -R "$EMU_REPO" --workflow="$EMU_WORKFLOW" \
     --event=workflow_dispatch --limit 10 \
@@ -314,7 +320,7 @@ print(chosen.get("headBranch") or "")
 }
 
 view_run() {
-  gh_cmd run view "$1" -R "$EMU_REPO" --json status,conclusion,url,displayTitle
+  gh_cmd run view "$1" -R "$EMU_REPO" --json status,conclusion,url,displayTitle,headBranch
 }
 
 # Lecture seule d'un run déjà lancé : l'agent n'a pas de jeton, il passe par ici (sudo) au lieu
@@ -366,6 +372,10 @@ run_e2e() {
   watchdog_start
   rider_ref=$(resolve_one "$RIDER_REPO")
   driver_ref=$(resolve_one "$DRIVER_REPO")
+  # emu_ref : branche du harnais lui-même. Sans --ref, `gh workflow run` exécute
+  # TOUJOURS la version du workflow sur la branche par défaut (main) du dépôt
+  # emu — jamais celle de la branche de travail, même si rider_ref/driver_ref
+  # pointent dessus (revue : l.361, chaque e2e tournait sur le harnais de main).
   emu_ref=$(resolve_one "$EMU_REPO_NAME")
   echo "déclenchement : $EMU_REPO $EMU_WORKFLOW"
   echo "rider_ref=${rider_ref} driver_ref=${driver_ref} emu_ref=${emu_ref} model=${EMU_E2E_MODEL}"
@@ -394,6 +404,9 @@ run_e2e() {
   run_id=""
   run_branch=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
+    # find_new_run filtre désormais par branche (emu_ref) : un run plus récent
+    # mais sur une autre branche (ex. un autre job sur main) ne doit jamais être
+    # pris pour celui qu'on vient de déclencher, s'il en existe un sur la bonne.
     if found=$(find_new_run "$since" "$emu_ref" 2>/dev/null); then
       run_id=$(printf '%s\n' "$found" | sed -n '1p')
       run_branch=$(printf '%s\n' "$found" | sed -n '2p')
@@ -405,16 +418,19 @@ run_e2e() {
     [ "$EMU_E2E_POLL_SEC" -gt 0 ] && sleep "$EMU_E2E_POLL_SEC"
     [ "$EMU_E2E_POLL_SEC" -eq 0 ] && sleep 1
   done
-  [ -n "$run_id" ] || fail "aucun run e2e trouvé avant le délai (déclenchement peut-être refusé)"
+  [ -n "$run_id" ] || fail "aucun run e2e trouvé avant le délai sur la branche ${emu_ref} (déclenchement peut-être refusé ou mauvais ref)"
   RUN_ID_CUR="$run_id"
   echo "run=${run_id} https://github.com/${EMU_REPO}/actions/runs/${run_id}"
 
   # Garde de sécurité, en plus du filtre de find_new_run : même le run choisi est revérifié avant
   # de laisser son verdict se lire comme un test. Jamais un faux FAIL de test : le message nomme
-  # explicitement la cause. Pas d'appel gh supplémentaire : headBranch vient du `run list` déjà fait.
+  # explicitement la cause (« mauvais ref »). Pas d'appel gh supplémentaire ici : headBranch vient
+  # du `run list` déjà fait dans find_new_run — un second appel `run view` ajouterait une lecture
+  # non comptée aux scénarios d'attente déjà calibrés plus bas (done=1, flaky=3, broken<=5), sans
+  # couvrir un cas de divergence API list/view plus rare que celui, avéré, que ce filtre corrige.
   if [ -z "$run_branch" ] || [ "$run_branch" != "$emu_ref" ]; then
     echo "verdict=FAIL ref_erronee run=${run_id} attendu=${emu_ref} obtenu=${run_branch:-?}"
-    fail "run ${run_id} déclenché sur ${run_branch:-?} au lieu de ${emu_ref} : jamais lu comme un échec de test"
+    fail "mauvais ref : run ${run_id} déclenché sur head_branch=${run_branch:-?} au lieu de ${emu_ref} (jamais lu comme un échec de test)"
   fi
 
   # Attente bornée de l'état du run : on sort dès que status=completed (ou qu'une
