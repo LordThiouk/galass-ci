@@ -75,8 +75,9 @@ case "$cmd" in
     sub="${1:-}"; shift || true
     case "$sub" in
       list)
-        # Un run créé juste après le since du script.
-        printf '%s\n' '[{"databaseId":4242,"createdAt":"2099-01-01T00:00:00Z","status":"in_progress","conclusion":"","url":"https://example.test/4242"}]'
+        # Un run créé juste après le since du script. headBranch=main : galass-emu-actions-pub
+        # n'a pas la branche de travail dans ce mock (emu_ref retombe sur main).
+        printf '%s\n' '[{"databaseId":4242,"createdAt":"2099-01-01T00:00:00Z","status":"in_progress","conclusion":"","url":"https://example.test/4242","headBranch":"main"}]'
         ;;
       view)
         id="${1:-}"
@@ -175,7 +176,7 @@ case "$cmd" in
   run)
     sub="${1:-}"
     case "$sub" in
-      list) printf '%s\n' '[{"databaseId":7,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"https://example.test/7"}]' ;;
+      list) printf '%s\n' '[{"databaseId":7,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"https://example.test/7","headBranch":"main"}]' ;;
       view) printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/7","displayTitle":"e2e"}' ;;
       *) exit 2 ;;
     esac
@@ -208,7 +209,7 @@ case "$cmd" in
   run)
     sub="${1:-}"
     case "$sub" in
-      list) printf '%s\n' '[{"databaseId":9,"createdAt":"2099-01-01T00:00:00Z","status":"in_progress","conclusion":"","url":"https://example.test/9"}]' ;;
+      list) printf '%s\n' '[{"databaseId":9,"createdAt":"2099-01-01T00:00:00Z","status":"in_progress","conclusion":"","url":"https://example.test/9","headBranch":"feat/multi"}]' ;;
       view) printf '%s\n' '{"status":"in_progress","conclusion":"","url":"https://example.test/9","displayTitle":"e2e"}' ;;
       *) exit 2 ;;
     esac
@@ -243,7 +244,7 @@ case "$cmd" in
     sub="${1:-}"; shift || true
     case "$sub" in
       list)
-        printf '%s\n' '[{"databaseId":55,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"https://example.test/55"}]'
+        printf '%s\n' '[{"databaseId":55,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"https://example.test/55","headBranch":"feat/multi"}]'
         ;;
       view)
         if printf '%s\n' "$*" | grep -q -- '--log-failed'; then exit 0; fi
@@ -406,5 +407,99 @@ grep -q 'MemoryMax=' "$wf" || ko "plafond mémoire retiré du workflow"
 # Liste blanche toujours sourcée / figée.
 grep -q 'allowed-repos.sh' "$wf" || ko "allowed-repos.sh retiré du workflow"
 ok "workflow : input false par défaut, e2e distant, gardes FullRun intactes"
+
+# --- 3d. --ref sur le dépôt emu (bug run 44238051634 : main exécuté au lieu de la branche de
+# travail) : le dispatch doit porter --ref="$emu_ref", et find_new_run/run_e2e doivent refuser un
+# run dont headBranch n'est pas emu_ref, jamais comme un faux FAIL de test. ------------------------
+cat > "$tmp/mock-gh-ref" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${EMU_E2E_GH_LOG_REF:?}"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  api)
+    path=""
+    for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
+    case "${REF_MODE:-has}" in
+      has) case "$path" in repos/LordThiouk/*/branches/*) exit 0 ;; *) exit 1 ;; esac ;;
+      missing_emu)
+        case "$path" in
+          repos/LordThiouk/galass-emu-actions-pub/branches/*) exit 1 ;;
+          repos/LordThiouk/*/branches/*) exit 0 ;;
+          *) exit 1 ;;
+        esac
+        ;;
+    esac
+    ;;
+  workflow)
+    [ "${1:-}" = run ] || exit 2
+    printf '%s\n' "$*" >> "${EMU_E2E_GH_LOG_REF}.dispatch"
+    exit 0
+    ;;
+  run)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      list)
+        printf '%s\n' "${REF_LIST_JSON:?}"
+        ;;
+      view) printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/x","displayTitle":"e2e"}' ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+MOCK
+chmod +x "$tmp/mock-gh-ref"
+ref_run() { # $1=REF_MODE, $2=REF_LIST_JSON, reste = env supplémentaire
+  local mode="$1" listjson="$2"; shift 2
+  : > "$tmp/gh-ref.log"; : > "$tmp/gh-ref.log.dispatch"
+  set +e
+  refrun_out=$(env "$@" REF_MODE="$mode" REF_LIST_JSON="$listjson" \
+    EMU_E2E_GH="$tmp/mock-gh-ref" EMU_E2E_GH_LOG_REF="$tmp/gh-ref.log" \
+    OC_BRANCH="feat/multi" EMU_E2E_TIMEOUT_SEC=5 EMU_E2E_POLL_SEC=0 "$sh" run 2>&1)
+  refrun_rc=$?
+  set -e
+}
+
+# (1) branche de travail présente sur emu : --ref=feat/multi transmis, emu_ref=feat/multi au log.
+run_on_branch='[{"databaseId":101,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"u","headBranch":"feat/multi"}]'
+ref_run has "$run_on_branch"
+[ "$refrun_rc" -eq 0 ] || ko "--ref (branche présente) : rc=$refrun_rc (attendu 0) : $refrun_out"
+printf '%s' "$refrun_out" | grep -q 'emu_ref=feat/multi' || ko "--ref : emu_ref absent du log (branche présente) : $refrun_out"
+grep -q -- '--ref feat/multi' "$tmp/gh-ref.log.dispatch" \
+  || ko "--ref : le dispatch doit porter --ref feat/multi (branche présente) : $(cat "$tmp/gh-ref.log.dispatch")"
+ok "--ref : branche de travail présente sur emu → --ref=\$emu_ref transmis au dispatch"
+
+# (2) branche de travail absente sur emu (cas du bug) : fallback --ref=main, même note que rider/driver.
+run_on_main='[{"databaseId":102,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"u","headBranch":"main"}]'
+ref_run missing_emu "$run_on_main"
+[ "$refrun_rc" -eq 0 ] || ko "--ref (fallback) : rc=$refrun_rc (attendu 0) : $refrun_out"
+printf '%s' "$refrun_out" | grep -q 'emu_ref=main' || ko "--ref (fallback) : emu_ref devrait être main : $refrun_out"
+printf '%s' "$refrun_out" | grep -q "galass-emu-actions-pub n'a pas la branche feat/multi" \
+  || ko "--ref (fallback) : note de fallback absente pour galass-emu-actions-pub : $refrun_out"
+grep -q -- '--ref main' "$tmp/gh-ref.log.dispatch" \
+  || ko "--ref (fallback) : le dispatch doit porter --ref main : $(cat "$tmp/gh-ref.log.dispatch")"
+ok "--ref : branche de travail absente sur emu → fallback --ref=main, note explicite"
+
+# (3) run 44238051634 reproduit : le seul run trouvable est sur le mauvais head_branch (main, alors
+# qu'emu_ref=feat/multi) → verdict=FAIL explicite « ref_erronee », jamais lu comme un échec de test.
+run_on_wrong_branch='[{"databaseId":103,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"failure","url":"u","headBranch":"main"}]'
+ref_run has "$run_on_wrong_branch"
+[ "$refrun_rc" -ne 0 ] || ko "head_branch erroné : aurait dû échouer (run sur main, emu_ref=feat/multi)"
+printf '%s' "$refrun_out" | grep -q 'ref_erronee' \
+  || ko "head_branch erroné : verdict=FAIL ref_erronee absent : $refrun_out"
+printf '%s' "$refrun_out" | grep -q 'attendu=feat/multi' || ko "head_branch erroné : attendu= absent : $refrun_out"
+printf '%s' "$refrun_out" | grep -q 'obtenu=main' || ko "head_branch erroné : obtenu= absent : $refrun_out"
+printf '%s' "$refrun_out" | grep -qv '^e2e : échec' ; : # pas d'assertion négative fragile, juste un rappel visuel
+printf '%s' "$refrun_out" | grep -q 'extrait des logs' && ko "head_branch erroné : ne doit jamais lire l'extrait d'un run sur la mauvaise branche (confondu avec un vrai échec de test)"
+ok "head_branch erroné (run 44238051634) : verdict=FAIL ref_erronee explicite, jamais lu comme un échec de test"
+
+# (4) find_new_run filtre : deux runs dans la fenêtre since, l'un sur main, l'autre sur la branche de
+# travail — seul celui sur la branche de travail doit être choisi (jamais le plus récent au hasard).
+two_runs='[{"databaseId":200,"createdAt":"2099-01-01T00:00:05Z","status":"completed","conclusion":"success","url":"u","headBranch":"main"},{"databaseId":201,"createdAt":"2099-01-01T00:00:00Z","status":"completed","conclusion":"success","url":"u","headBranch":"feat/multi"}]'
+ref_run has "$two_runs"
+[ "$refrun_rc" -eq 0 ] || ko "filtre find_new_run : rc=$refrun_rc (attendu 0) : $refrun_out"
+printf '%s' "$refrun_out" | grep -q 'run=201' || ko "filtre find_new_run : aurait dû choisir le run 201 (bonne branche), pas 200 : $refrun_out"
+ok "find_new_run filtre sur headBranch : le run de la bonne branche est choisi, pas le plus récent au hasard"
 
 echo "tous les contrôles with_emulators sont passés"

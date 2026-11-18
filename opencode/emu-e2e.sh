@@ -179,13 +179,18 @@ resolve_refs() {
   read_token
   rider_ref=$(resolve_one "$RIDER_REPO")
   driver_ref=$(resolve_one "$DRIVER_REPO")
+  emu_ref=$(resolve_one "$EMU_REPO_NAME")
   echo "rider_ref=${rider_ref}"
   echo "driver_ref=${driver_ref}"
+  echo "emu_ref=${emu_ref}"
   if [ "$rider_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
     echo "note : ${RIDER_REPO} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
   fi
   if [ "$driver_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
     echo "note : ${DRIVER_REPO} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
+  fi
+  if [ "$emu_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
+    echo "note : ${EMU_REPO_NAME} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
   fi
 }
 
@@ -279,20 +284,33 @@ gh_cmd() {
 }
 
 find_new_run() {
-  local since="$1" json
+  # $2 (want_branch) : préfère un run dont headBranch == want_branch, pour ne jamais ramasser à
+  # sa place un run déclenché ailleurs (une relance manuelle sur main, un autre FullRun) quand un
+  # run sur la bonne branche existe dans la fenêtre. S'il n'en existe aucun sur la bonne branche
+  # mais qu'un run existe quand même dans la fenêtre (autre branche), on le retourne tout de même :
+  # c'est exactement le scénario du bug d'origine (dispatch sans --ref -> run exécuté sur main), et
+  # c'est à l'appelant (run_e2e) de le refuser nommément via la garde head_branch, jamais en silence
+  # par un simple timeout générique. Imprime deux lignes (id, headBranch du run choisi) : l'appelant
+  # revérifie la seconde sans refaire d'appel gh — même réponse de `run list` que celle filtrée ici.
+  local since="$1" want_branch="$2" json
   json=$(gh_cmd run list -R "$EMU_REPO" --workflow="$EMU_WORKFLOW" \
     --event=workflow_dispatch --limit 10 \
-    --json databaseId,createdAt,status,conclusion,url) || return 1
+    --json databaseId,createdAt,status,conclusion,url,headBranch) || return 1
   python3 -c '
 import json,sys
 since=sys.argv[1]
+want=sys.argv[3]
 rows=json.loads(sys.argv[2])
 cands=[r for r in rows if (r.get("createdAt") or "") >= since]
 if not cands:
     sys.exit(2)
-cands.sort(key=lambda r: r.get("createdAt") or "", reverse=True)
-print(cands[0]["databaseId"])
-' "$since" "$json"
+right=[r for r in cands if (r.get("headBranch") or "") == want]
+pool=right if right else cands
+pool.sort(key=lambda r: r.get("createdAt") or "", reverse=True)
+chosen=pool[0]
+print(chosen["databaseId"])
+print(chosen.get("headBranch") or "")
+' "$since" "$json" "$want_branch"
 }
 
 view_run() {
@@ -348,17 +366,25 @@ run_e2e() {
   watchdog_start
   rider_ref=$(resolve_one "$RIDER_REPO")
   driver_ref=$(resolve_one "$DRIVER_REPO")
+  emu_ref=$(resolve_one "$EMU_REPO_NAME")
   echo "déclenchement : $EMU_REPO $EMU_WORKFLOW"
-  echo "rider_ref=${rider_ref} driver_ref=${driver_ref} model=${EMU_E2E_MODEL}"
+  echo "rider_ref=${rider_ref} driver_ref=${driver_ref} emu_ref=${emu_ref} model=${EMU_E2E_MODEL}"
   if [ "$rider_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
     echo "note : ${RIDER_REPO} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
   fi
   if [ "$driver_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
     echo "note : ${DRIVER_REPO} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
   fi
+  if [ "$emu_ref" = "$FALLBACK_REF" ] && [ "$OC_BRANCH" != "$FALLBACK_REF" ]; then
+    echo "note : ${EMU_REPO_NAME} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
+  fi
 
   since=$(iso_minus 15)
-  if ! gh_cmd workflow run "$EMU_WORKFLOW" -R "$EMU_REPO" \
+  # --ref="$emu_ref" : sans lui, le dispatch exécute toujours le harnais (e2e/*.sh, workflow) de la
+  # branche par défaut du dépôt emu, même quand rider_ref/driver_ref pointent la branche de travail
+  # (run 44238051634 : head_branch=main, échec immédiat sur du code que la branche de travail ne contient
+  # plus). --ref ne change pas rider_ref/driver_ref, qui restent des inputs du workflow.
+  if ! gh_cmd workflow run "$EMU_WORKFLOW" -R "$EMU_REPO" --ref "$emu_ref" \
       -f "rider_ref=${rider_ref}" -f "driver_ref=${driver_ref}" \
       -f "model=${EMU_E2E_MODEL}"; then
     fail "échec du déclenchement : le jeton GALASS_TOKEN a-t-il le droit actions:write sur ${EMU_REPO} ?"
@@ -366,8 +392,11 @@ run_e2e() {
 
   deadline=$(( $(date +%s) + EMU_E2E_TIMEOUT_SEC ))
   run_id=""
+  run_branch=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if run_id=$(find_new_run "$since" 2>/dev/null); then
+    if found=$(find_new_run "$since" "$emu_ref" 2>/dev/null); then
+      run_id=$(printf '%s\n' "$found" | sed -n '1p')
+      run_branch=$(printf '%s\n' "$found" | sed -n '2p')
       [ -n "$run_id" ] && break
     fi
     run_id=""
@@ -379,6 +408,14 @@ run_e2e() {
   [ -n "$run_id" ] || fail "aucun run e2e trouvé avant le délai (déclenchement peut-être refusé)"
   RUN_ID_CUR="$run_id"
   echo "run=${run_id} https://github.com/${EMU_REPO}/actions/runs/${run_id}"
+
+  # Garde de sécurité, en plus du filtre de find_new_run : même le run choisi est revérifié avant
+  # de laisser son verdict se lire comme un test. Jamais un faux FAIL de test : le message nomme
+  # explicitement la cause. Pas d'appel gh supplémentaire : headBranch vient du `run list` déjà fait.
+  if [ -z "$run_branch" ] || [ "$run_branch" != "$emu_ref" ]; then
+    echo "verdict=FAIL ref_erronee run=${run_id} attendu=${emu_ref} obtenu=${run_branch:-?}"
+    fail "run ${run_id} déclenché sur ${run_branch:-?} au lieu de ${emu_ref} : jamais lu comme un échec de test"
+  fi
 
   # Attente bornée de l'état du run : on sort dès que status=completed (ou qu'une
   # conclusion existe), sans dormir de plus. Trois bornes indépendantes : l'échéance
