@@ -6,6 +6,7 @@
 # sur galass-ci. Le jeton (GALASS_TOKEN) n'est jamais affiché ni passé à opencode.
 #
 #   emu-e2e.sh run            déclenche, attend, affiche le verdict
+#   emu-e2e.sh status <run_id> état du run (lecture seule, id numérique) : status=… conclusion=…
 #   emu-e2e.sh resolve-refs   affiche rider_ref et driver_ref
 #   emu-e2e.sh prompt-block   bloc à ajouter au prompt (aucun secret)
 #   emu-e2e.sh append-prompt  ajoute le bloc à $OC_WORK/prompt.md
@@ -28,6 +29,12 @@ DEFAULT_TIMEOUT_SEC=10800
 DEFAULT_POLL_SEC=30
 DEFAULT_LOG_TAIL=80
 DEFAULT_LOG_WIDTH=300
+# Plafond par appel gh : un appel réseau qui pend ne doit jamais bloquer la boucle d'attente.
+DEFAULT_GH_TIMEOUT_SEC=60
+# Après TERM, KILL au bout de N s : un gh qui ignore TERM ne bloque pas non plus.
+GH_KILL_AFTER_SEC=5
+# Lectures consécutives du run en échec avant d'abandonner (erreurs transitoires tolérées).
+MAX_VIEW_FAILS=5
 FALLBACK_REF="main"
 
 fail() { echo "$1" >&2; exit 1; }
@@ -37,7 +44,7 @@ fail() { echo "$1" >&2; exit 1; }
 maybe_sudo() {
   local cmd="${1:-}"
   case "$cmd" in
-    run|resolve-refs) ;;
+    run|resolve-refs|status) ;;
     *) return 0 ;;
   esac
   [ "$(id -u)" -eq 0 ] && return 0
@@ -62,6 +69,7 @@ load_file_vars() {
       EMU_E2E_POLL_SEC) EMU_E2E_POLL_SEC="$v" ;;
       EMU_LOG_TAIL) EMU_LOG_TAIL="$v" ;;
       EMU_LOG_WIDTH) EMU_LOG_WIDTH="$v" ;;
+      EMU_E2E_GH_TIMEOUT_SEC) EMU_E2E_GH_TIMEOUT_SEC="$v" ;;
       *) ;;
     esac
   done < "$f"
@@ -76,12 +84,14 @@ load_config() {
   EMU_E2E_POLL_SEC="${EMU_E2E_POLL_SEC:-$DEFAULT_POLL_SEC}"
   EMU_LOG_TAIL="${EMU_LOG_TAIL:-$DEFAULT_LOG_TAIL}"
   EMU_LOG_WIDTH="${EMU_LOG_WIDTH:-$DEFAULT_LOG_WIDTH}"
+  EMU_E2E_GH_TIMEOUT_SEC="${EMU_E2E_GH_TIMEOUT_SEC:-$DEFAULT_GH_TIMEOUT_SEC}"
   if [ "$(id -u)" -eq 0 ] && [ -f "$CANON_STATE" ]; then
     OC_BRANCH=""; EMU_E2E_MODEL="$DEFAULT_MODEL"
     EMU_E2E_TIMEOUT_SEC="$DEFAULT_TIMEOUT_SEC"
     EMU_E2E_POLL_SEC="$DEFAULT_POLL_SEC"
     EMU_LOG_TAIL="$DEFAULT_LOG_TAIL"
     EMU_LOG_WIDTH="$DEFAULT_LOG_WIDTH"
+    EMU_E2E_GH_TIMEOUT_SEC="$DEFAULT_GH_TIMEOUT_SEC"
     load_file_vars "$CANON_STATE"
   elif [ -n "${EMU_E2E_STATE:-}" ] && [ -f "$EMU_E2E_STATE" ]; then
     load_file_vars "$EMU_E2E_STATE"
@@ -90,6 +100,10 @@ load_config() {
   [[ "${EMU_E2E_POLL_SEC}" =~ ^[0-9]+$ ]] || fail "intervalle de sondage invalide"
   [[ "${EMU_LOG_TAIL}" =~ ^[0-9]+$ ]] || fail "taille d'extrait invalide"
   [[ "${EMU_LOG_WIDTH}" =~ ^[0-9]+$ ]] || fail "largeur d'extrait invalide"
+  [[ "${EMU_E2E_GH_TIMEOUT_SEC}" =~ ^[0-9]+$ ]] || fail "timeout d'appel gh invalide"
+  if [ "$EMU_E2E_GH_TIMEOUT_SEC" -lt 1 ] || [ "$EMU_E2E_GH_TIMEOUT_SEC" -gt 600 ]; then
+    fail "timeout d'appel gh hors bornes (1-600)"
+  fi
   [ "$EMU_E2E_TIMEOUT_SEC" -ge 1 ] || fail "timeout invalide"
   [ "$EMU_E2E_POLL_SEC" -ge 0 ] || fail "intervalle de sondage invalide"
   if [ "$EMU_LOG_TAIL" -lt 1 ] || [ "$EMU_LOG_TAIL" -gt 200 ]; then
@@ -146,10 +160,9 @@ urlenc() {
 }
 
 branch_exists() {
-  local repo="$1" ref="$2" enc gh
-  gh=$(gh_bin)
+  local repo="$1" ref="$2" enc
   enc=$(urlenc "$ref")
-  GH_TOKEN="$token" GH_PROMPT_DISABLED=1 "$gh" api --silent "repos/${EMU_OWNER}/${repo}/branches/${enc}"
+  gh_cmd api --silent "repos/${EMU_OWNER}/${repo}/branches/${enc}"
 }
 
 resolve_one() {
@@ -207,6 +220,15 @@ la commande en boucle.
   \`opencode/deepseek-v4.1-flash-free\`). Le CLI opencode (pas une clé API)
   pilote les émulateurs sur le dépôt emu. Pas de FreeLLM, pas d'appel HTTP
   direct à un modèle. Les modèles FullRun restent \`opencode/*-free\`.
+- Lancement : l'outil dure jusqu'à la fin du run (plusieurs dizaines de minutes) ; lance-le en
+  tâche de fond détachée, en deux commandes séparées : d'abord \`LOG=/tmp/fullrun/e2e-run.log\`,
+  puis \`setsid nohup sudo -n -H -- env GITHUB_ACTIONS=true /opt/fullrun-tools/emu-e2e.sh run
+  > "\$LOG" 2>&1 < /dev/null &\`. Jamais \`A && B && nohup … &\` : le sous-shell garde la
+  sortie de ton outil ouverte, l'outil est tué au délai et le script avec lui.
+- Chaque sondage écrit une ligne datée dans ce log. Ne dors pas plus de 2 cycles sur un log qui
+  ne bouge plus : lis l'état réel avec \`sudo -n -H -- /opt/fullrun-tools/emu-e2e.sh status <run_id>\`
+  (lecture seule, l'équivalent de \`gh run view\`, sans jeton chez toi) et passe à la suite si le
+  run est \`status=completed\` (le verdict est dans \`conclusion=\`), ou signale le blocage.
 - Tu n'as aucun jeton : n'utilise pas \`gh\` toi-même, n'invente pas de secret,
   n'écris aucun secret. Passe seulement par le script figé ci-dessus
   (pas une copie dans le workspace).
@@ -255,43 +277,138 @@ if out:
 }
 
 gh_cmd() {
-  local gh
+  local gh timeout_sec
   gh=$(gh_bin)
-  GH_TOKEN="$token" GH_PROMPT_DISABLED=1 "$gh" "$@"
+  timeout_sec="${EMU_E2E_GH_TIMEOUT_SEC:-$DEFAULT_GH_TIMEOUT_SEC}"
+  # Chaque appel est plafonné : TERM à la limite puis KILL "$GH_KILL_AFTER_SEC" après (rc 124/137).
+  # Pas de repli sans plafond : sans `timeout`, on refuse plutôt que de risquer une attente infinie.
+  command -v timeout >/dev/null 2>&1 || fail "timeout introuvable : appel gh non borné refusé"
+  #
+  # Cause CI (run 44272795157) : `timeout -k`, pour atteindre un petit-enfant de "gh" resté bloqué
+  # (ex. un appel réseau interne qui pend) après que "gh" lui-même a été tué, doit viser tout le
+  # groupe de processus, pas seulement "gh". Cette mise en groupe est faite PAR `timeout` lui-même
+  # (setpgid sur son enfant direct avant l'exec) ; en local, ce mécanisme interne fonctionnait à
+  # tous les niveaux testés (KILL atteignait bien tout l'arbre, tube de sortie libéré en ~6 s). En
+  # CI, le process "gh" direct mourait bien (rc 124 obtenu via le chien de garde global de
+  # run_e2e, indépendant de ceci) mais un petit-enfant orphelin gardait le tube de sortie ouvert
+  # jusqu'à sa fin naturelle (~30 s) — preuve que CE mécanisme interne, dépendant de
+  # l'environnement/version, n'y plaçait pas (ou plus) "gh" et ses descendants dans un groupe que
+  # `timeout` pouvait cibler. Plutôt que de dépendre de ce détail d'implémentation non portable
+  # (une tentative avec `setsid` en préfixe a été essayée puis écartée : "setsid", invoqué comme
+  # enfant d'un `timeout` qui a déjà fait de lui un meneur de groupe, se refork lui-même dans un
+  # DEUXIÈME groupe que `timeout` ne surveille plus — pire, pas mieux), on crée nous-mêmes ce
+  # groupe, par le contrôle de tâches natif de bash (`set -m`, pur et portable, indépendant de
+  # tout binaire externe) : tout processus lancé en arrière-plan sous `set -m` devient le meneur
+  # de son propre nouveau groupe (pgid = son pid), que ses descendants héritent tels quels. On
+  # revérifie nous-mêmes, après le retour de `timeout`, qu'aucun descendant ne survit dans ce
+  # groupe ; si c'est le cas (le scénario CI), on l'achève nous-mêmes par KILL sur le groupe entier
+  # (pid négatif) avant de rendre la main — sans jamais dépendre de ce que `timeout` a réussi, ou
+  # non, à faire lui-même de son côté.
+  (
+    set -m
+    GH_TOKEN="$token" GH_PROMPT_DISABLED=1 \
+      timeout -k "$GH_KILL_AFTER_SEC" "$timeout_sec" "$gh" "$@" &
+    pid=$!
+    # `set +m` dès le pid capturé : le groupe (créé à l'instant par `set -m` ci-dessus) est déjà
+    # fixé, mais le mode moniteur fait aussi imprimer par bash des lignes « [1]+ Done/Exit » sur
+    # la sortie de ce job dès que `wait` le voit se terminer — du bruit qui polluerait le JSON lu
+    # par l'appelant. On le désactive juste après, avant le `wait`, uniquement pour ce filtrage.
+    set +m 2>/dev/null
+    wait "$pid"
+    rc=$?
+    # Filet de sécurité : le groupe créé par `set -m` pour ce job (pgid == $pid) peut encore
+    # contenir un descendant orphelin que `timeout` n'a pas réussi à joindre. On l'achève
+    # nous-mêmes avant de rendre la main, pour ne jamais laisser le tube de sortie ouvert plus
+    # longtemps que "$timeout_sec" + "$GH_KILL_AFTER_SEC".
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    exit "$rc"
+  )
 }
 
 find_new_run() {
-  # ref : filtre obligatoire par branche (revue). Sans lui, un run plus récent
-  # mais déclenché sur une autre branche (ex. main, par un autre job) passerait
-  # avant le bon run — même dans la fenêtre "since".
-  local since="$1" ref="$2" json
+  # $2 (want_branch) : préfère un run dont headBranch == want_branch, pour ne jamais ramasser à
+  # sa place un run déclenché ailleurs (une relance manuelle sur main, un autre FullRun) quand un
+  # run sur la bonne branche existe dans la fenêtre. S'il n'en existe aucun sur la bonne branche
+  # mais qu'un run existe quand même dans la fenêtre (autre branche), on le retourne tout de même :
+  # c'est exactement le scénario du bug d'origine (dispatch sans --ref -> run exécuté sur main), et
+  # c'est à l'appelant (run_e2e) de le refuser nommément via la garde head_branch, jamais en silence
+  # par un simple timeout générique (sinon, un filtre strict qui exclurait d'emblée tout run sur la
+  # mauvaise branche ne retrouverait jamais ce run, et on perdrait le message explicite « mauvais
+  # ref » au profit d'un timeout muet). Imprime deux lignes (id, headBranch du run choisi) :
+  # l'appelant revérifie la seconde sans refaire d'appel gh — même réponse de `run list` que celle
+  # filtrée ici.
+  local since="$1" want_branch="$2" json
   json=$(gh_cmd run list -R "$EMU_REPO" --workflow="$EMU_WORKFLOW" \
     --event=workflow_dispatch --limit 10 \
     --json databaseId,createdAt,status,conclusion,url,headBranch) || return 1
   python3 -c '
 import json,sys
-since, ref = sys.argv[1], sys.argv[2]
-rows=json.loads(sys.argv[3])
-cands=[r for r in rows if (r.get("createdAt") or "") >= since and (r.get("headBranch") or "") == ref]
+since=sys.argv[1]
+want=sys.argv[3]
+rows=json.loads(sys.argv[2])
+cands=[r for r in rows if (r.get("createdAt") or "") >= since]
 if not cands:
     sys.exit(2)
-cands.sort(key=lambda r: r.get("createdAt") or "", reverse=True)
-print(cands[0]["databaseId"])
-' "$since" "$ref" "$json"
+right=[r for r in cands if (r.get("headBranch") or "") == want]
+pool=right if right else cands
+pool.sort(key=lambda r: r.get("createdAt") or "", reverse=True)
+chosen=pool[0]
+print(chosen["databaseId"])
+print(chosen.get("headBranch") or "")
+' "$since" "$json" "$want_branch"
 }
 
 view_run() {
   gh_cmd run view "$1" -R "$EMU_REPO" --json status,conclusion,url,displayTitle,headBranch
 }
 
+# Lecture seule d'un run déjà lancé : l'agent n'a pas de jeton, il passe par ici (sudo) au lieu
+# de relire un log qui ne bouge plus. Une ligne, rc 0 si lu, 1 sinon.
+# Chien de garde : échéance dure = délai + un dernier tour de sondage + deux appels gh plafonnés.
+# Passé ce délai, USR1 au processus principal (trap → verdict=timeout, exit 124).
+watchdog_start() {
+  local hard main=$$
+  hard=$(( EMU_E2E_TIMEOUT_SEC + EMU_E2E_POLL_SEC + 2 * (EMU_E2E_GH_TIMEOUT_SEC + GH_KILL_AFTER_SEC) + 30 ))
+  (
+    sleep "$hard" & sp=$!
+    trap 'kill "$sp" 2>/dev/null; exit 0' TERM
+    wait "$sp" && kill -USR1 "$main" 2>/dev/null
+  ) &
+  WATCHDOG_PID=$!
+  trap 'kill "$WATCHDOG_PID" 2>/dev/null' EXIT
+}
+
+status_run() {
+  local id="${1:-}" view
+  [[ "$id" =~ ^[0-9]{1,20}$ ]] || fail "status : identifiant de run numérique requis"
+  load_config
+  read_token
+  view=$(view_run "$id" 2>/dev/null) || { echo "status=illisible run=${id}"; return 1; }
+  python3 -c '
+import json,sys
+d=json.loads(sys.argv[1])
+print("status=%s conclusion=%s run=%s" % (d.get("status") or "?", d.get("conclusion") or "-", sys.argv[2]))
+' "$view" "$id"
+}
+
 run_e2e() {
-  local since run_id deadline status conclusion url view s_status s_conclusion s_url
+  local since run_id deadline status conclusion url view s_status s_conclusion s_url t_start finds=0
   load_config
   EMU_E2E_MODEL=$(validate_model "$EMU_E2E_MODEL")
   if [ "${GITHUB_ACTIONS:-}" != "true" ] && [ -z "${EMU_E2E_GH:-}" ]; then
     fail "refus : lancer seulement depuis le FullRun (ou un test avec EMU_E2E_GH)"
   fi
   read_token
+  t_start=$(date +%s)
+  RUN_ID_CUR=""
+  # Sortie garantie : un signal (TERM/INT/HUP) ou le chien de garde laisse TOUJOURS une ligne
+  # verdict= dans le log, jamais un log muet. SIGKILL ne se piège pas : c'est pourquoi chaque
+  # sondage écrit aussi une ligne datée (un log figé = processus mort ou bloqué, détectable).
+  trap 'echo "verdict=interrompu signal=TERM run=${RUN_ID_CUR:-?}"; exit 143' TERM
+  trap 'echo "verdict=interrompu signal=INT run=${RUN_ID_CUR:-?}"; exit 130' INT
+  trap 'echo "verdict=interrompu signal=HUP run=${RUN_ID_CUR:-?}"; exit 129' HUP
+  trap 'echo "verdict=timeout watchdog run=${RUN_ID_CUR:-?} (échéance dure dépassée)"; exit 124' USR1
+  watchdog_start
   rider_ref=$(resolve_one "$RIDER_REPO")
   driver_ref=$(resolve_one "$DRIVER_REPO")
   # emu_ref : branche du harnais lui-même. Sans --ref, `gh workflow run` exécute
@@ -312,6 +429,10 @@ run_e2e() {
   fi
 
   since=$(iso_minus 15)
+  # --ref="$emu_ref" : sans lui, le dispatch exécute toujours le harnais (e2e/*.sh, workflow) de la
+  # branche par défaut du dépôt emu, même quand rider_ref/driver_ref pointent la branche de travail
+  # (run 44238051634 : head_branch=main, échec immédiat sur du code que la branche de travail ne contient
+  # plus). --ref ne change pas rider_ref/driver_ref, qui restent des inputs du workflow.
   if ! gh_cmd workflow run "$EMU_WORKFLOW" -R "$EMU_REPO" --ref "$emu_ref" \
       -f "rider_ref=${rider_ref}" -f "driver_ref=${driver_ref}" \
       -f "model=${EMU_E2E_MODEL}"; then
@@ -320,47 +441,89 @@ run_e2e() {
 
   deadline=$(( $(date +%s) + EMU_E2E_TIMEOUT_SEC ))
   run_id=""
+  run_branch=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
     # find_new_run filtre désormais par branche (emu_ref) : un run plus récent
     # mais sur une autre branche (ex. un autre job sur main) ne doit jamais être
-    # pris pour celui qu'on vient de déclencher.
-    if run_id=$(find_new_run "$since" "$emu_ref" 2>/dev/null); then
+    # pris pour celui qu'on vient de déclencher, s'il en existe un sur la bonne.
+    if found=$(find_new_run "$since" "$emu_ref" 2>/dev/null); then
+      run_id=$(printf '%s\n' "$found" | sed -n '1p')
+      run_branch=$(printf '%s\n' "$found" | sed -n '2p')
       [ -n "$run_id" ] && break
     fi
     run_id=""
+    finds=$(( finds + 1 ))
+    echo "$(date -u +%H:%M:%S) attente du démarrage du run : sondage ${finds} (+$(( $(date +%s) - t_start ))s)"
     [ "$EMU_E2E_POLL_SEC" -gt 0 ] && sleep "$EMU_E2E_POLL_SEC"
     [ "$EMU_E2E_POLL_SEC" -eq 0 ] && sleep 1
   done
   [ -n "$run_id" ] || fail "aucun run e2e trouvé avant le délai sur la branche ${emu_ref} (déclenchement peut-être refusé ou mauvais ref)"
+  RUN_ID_CUR="$run_id"
   echo "run=${run_id} https://github.com/${EMU_REPO}/actions/runs/${run_id}"
 
-  # Garde-fou supplémentaire (revue) : même après le filtre de find_new_run, on
-  # revérifie le head_branch du run RETENU avant d'en attendre le verdict.
-  # Jamais de silence sur un mauvais ref (ex. API en retard, run réutilisé).
-  view0=$(view_run "$run_id") || fail "impossible de lire le run ${run_id}"
-  head_branch=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("headBranch") or "")' "$view0")
-  [ "$head_branch" = "$emu_ref" ] \
-    || fail "mauvais ref : run ${run_id} sur head_branch=${head_branch:-?} (attendu ${emu_ref})"
+  # Première garde, bon marché (aucun appel gh : headBranch vient du `run list` déjà fait
+  # dans find_new_run) : le run choisi est revérifié avant de laisser son verdict se lire
+  # comme un test. Jamais un faux FAIL de test : le message nomme explicitement la cause
+  # (« mauvais ref »). Elle ne suffit pas seule : `run list` et `run view` peuvent diverger
+  # (API en retard, run réutilisé) — c'est pourquoi la boucle d'attente plus bas revérifie
+  # aussi le head_branch sur chaque lecture via `run view`, sans appel gh supplémentaire ni
+  # changement des bornes déjà calibrées (done/flaky/broken).
+  if [ -z "$run_branch" ] || [ "$run_branch" != "$emu_ref" ]; then
+    echo "verdict=FAIL ref_erronee run=${run_id} attendu=${emu_ref} obtenu=${run_branch:-?}"
+    fail "mauvais ref : run ${run_id} déclenché sur head_branch=${run_branch:-?} au lieu de ${emu_ref} (jamais lu comme un échec de test)"
+  fi
 
+  # Attente bornée de l'état du run : on sort dès que status=completed (ou qu'une
+  # conclusion existe), sans dormir de plus. Trois bornes indépendantes : l'échéance
+  # horloge, un nombre maximal de lectures, et MAX_VIEW_FAILS lectures consécutives en
+  # échec (les erreurs transitoires sont tolérées, pas indéfiniment).
   status=""
   conclusion=""
   url=""
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    view=$(view_run "$run_id") || fail "impossible de lire le run ${run_id}"
-    eval "$(python3 -c '
+  local polls=0 view_fails=0 poll_step max_polls
+  poll_step="$EMU_E2E_POLL_SEC"
+  [ "$poll_step" -ge 1 ] || poll_step=1
+  max_polls=$(( EMU_E2E_TIMEOUT_SEC / poll_step + 5 ))
+  while [ "$(date +%s)" -lt "$deadline" ] && [ "$polls" -lt "$max_polls" ]; do
+    polls=$(( polls + 1 ))
+    if view=$(view_run "$run_id" 2>/dev/null); then
+      view_fails=0
+      eval "$(python3 -c '
 import json,sys,shlex
 d=json.loads(sys.argv[1])
-for k in ("status","conclusion","url"):
-    print("s_%s=%s" % (k, shlex.quote(str(d.get(k) or ""))))
+for k in ("status","conclusion","url","headBranch"):
+    print("s_%s=%s" % (k.lower(), shlex.quote(str(d.get(k) or ""))))
 ' "$view")"
-    status="$s_status"
-    conclusion="$s_conclusion"
-    url="$s_url"
-    case "$status" in
-      completed|cancelled) break ;;
-    esac
-    [ "$EMU_E2E_POLL_SEC" -gt 0 ] && sleep "$EMU_E2E_POLL_SEC"
-    [ "$EMU_E2E_POLL_SEC" -eq 0 ] && sleep 1
+      status="$s_status"
+      conclusion="$s_conclusion"
+      url="$s_url"
+      # Régression (revue) : find_new_run filtre par headBranch via `run list`, mais `run
+      # list` et `run view` peuvent diverger (API en retard, run réutilisé) — la fusion avec
+      # main avait retiré la revérification indépendante du head_branch via `run view` que
+      # PR #11 ajoutait, en se fiant seulement à `run list`. Preuve du retrait : avec un faux
+      # gh où list=feat/multi mais view=main, l'ancien code lisait « e2e : succès » (rc=0).
+      # On revérifie ici sur CHAQUE lecture réussie (le head_branch d'un run ne change pas
+      # pendant sa vie, donc la première lecture suffit à trancher) — sans appel gh
+      # supplémentaire ni modification des bornes d'attente (deadline/max_polls/MAX_VIEW_FAILS
+      # inchangées), pour ne pas rouvrir les comptages déjà calibrés des scénarios done/
+      # flaky/broken juste au-dessous. Un headBranch absent (API qui ne le renverrait pas)
+      # n'est pas traité comme une erreur : seule une divergence avérée doit FAIL.
+      if [ -n "$s_headbranch" ] && [ "$s_headbranch" != "$emu_ref" ]; then
+        echo "verdict=FAIL ref_erronee run=${run_id} attendu=${emu_ref} obtenu=${s_headbranch}"
+        fail "mauvais ref : run ${run_id} sur head_branch=${s_headbranch} (attendu ${emu_ref}) — divergence list/view, jamais lu comme un succès de test"
+      fi
+      echo "$(date -u +%H:%M:%S) sondage ${polls}/${max_polls} (+$(( $(date +%s) - t_start ))s) run=${run_id} status=${status:-?} conclusion=${conclusion:--}"
+      if [ "$status" = "completed" ] || [ "$status" = "cancelled" ] || [ -n "$conclusion" ]; then
+        [ "$status" = "completed" ] || status="completed"
+        break
+      fi
+    else
+      view_fails=$(( view_fails + 1 ))
+      echo "$(date -u +%H:%M:%S) sondage ${polls}/${max_polls} (+$(( $(date +%s) - t_start ))s) run=${run_id} lecture en échec (${view_fails}/${MAX_VIEW_FAILS})"
+      [ "$view_fails" -lt "$MAX_VIEW_FAILS" ] \
+        || fail "impossible de lire le run ${run_id} (${view_fails} échecs consécutifs)"
+    fi
+    sleep "$poll_step"
   done
 
   if [ "$status" != "completed" ] && [ "$status" != "cancelled" ]; then
@@ -388,12 +551,13 @@ for k in ("status","conclusion","url"):
 
 cmd="${1:-}"
 case "$cmd" in
-  run|resolve-refs) maybe_sudo "$@" ;;
+  run|resolve-refs|status) maybe_sudo "$@" ;;
 esac
 
 case "$cmd" in
   run) run_e2e ;;
   resolve-refs) resolve_refs ;;
+  status) shift; status_run "${1:-}" ;;
   prompt-block) prompt_block ;;
   append-prompt) append_prompt ;;
   *) fail "commande inconnue : ${cmd:-<vide>}" ;;
