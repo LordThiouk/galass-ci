@@ -277,13 +277,52 @@ if out:
 }
 
 gh_cmd() {
-  local gh
+  local gh timeout_sec
   gh=$(gh_bin)
-  # Chaque appel est plafonné : TERM à la limite puis KILL 5 s après (rc 124/137). Pas de repli
-  # sans plafond : sans `timeout`, on refuse plutôt que de risquer une attente infinie.
+  timeout_sec="${EMU_E2E_GH_TIMEOUT_SEC:-$DEFAULT_GH_TIMEOUT_SEC}"
+  # Chaque appel est plafonné : TERM à la limite puis KILL "$GH_KILL_AFTER_SEC" après (rc 124/137).
+  # Pas de repli sans plafond : sans `timeout`, on refuse plutôt que de risquer une attente infinie.
   command -v timeout >/dev/null 2>&1 || fail "timeout introuvable : appel gh non borné refusé"
-  GH_TOKEN="$token" GH_PROMPT_DISABLED=1 \
-    timeout -k "$GH_KILL_AFTER_SEC" "${EMU_E2E_GH_TIMEOUT_SEC:-$DEFAULT_GH_TIMEOUT_SEC}" "$gh" "$@"
+  #
+  # Cause CI (run 44272795157) : `timeout -k`, pour atteindre un petit-enfant de "gh" resté bloqué
+  # (ex. un appel réseau interne qui pend) après que "gh" lui-même a été tué, doit viser tout le
+  # groupe de processus, pas seulement "gh". Cette mise en groupe est faite PAR `timeout` lui-même
+  # (setpgid sur son enfant direct avant l'exec) ; en local, ce mécanisme interne fonctionnait à
+  # tous les niveaux testés (KILL atteignait bien tout l'arbre, tube de sortie libéré en ~6 s). En
+  # CI, le process "gh" direct mourait bien (rc 124 obtenu via le chien de garde global de
+  # run_e2e, indépendant de ceci) mais un petit-enfant orphelin gardait le tube de sortie ouvert
+  # jusqu'à sa fin naturelle (~30 s) — preuve que CE mécanisme interne, dépendant de
+  # l'environnement/version, n'y plaçait pas (ou plus) "gh" et ses descendants dans un groupe que
+  # `timeout` pouvait cibler. Plutôt que de dépendre de ce détail d'implémentation non portable
+  # (une tentative avec `setsid` en préfixe a été essayée puis écartée : "setsid", invoqué comme
+  # enfant d'un `timeout` qui a déjà fait de lui un meneur de groupe, se refork lui-même dans un
+  # DEUXIÈME groupe que `timeout` ne surveille plus — pire, pas mieux), on crée nous-mêmes ce
+  # groupe, par le contrôle de tâches natif de bash (`set -m`, pur et portable, indépendant de
+  # tout binaire externe) : tout processus lancé en arrière-plan sous `set -m` devient le meneur
+  # de son propre nouveau groupe (pgid = son pid), que ses descendants héritent tels quels. On
+  # revérifie nous-mêmes, après le retour de `timeout`, qu'aucun descendant ne survit dans ce
+  # groupe ; si c'est le cas (le scénario CI), on l'achève nous-mêmes par KILL sur le groupe entier
+  # (pid négatif) avant de rendre la main — sans jamais dépendre de ce que `timeout` a réussi, ou
+  # non, à faire lui-même de son côté.
+  (
+    set -m
+    GH_TOKEN="$token" GH_PROMPT_DISABLED=1 \
+      timeout -k "$GH_KILL_AFTER_SEC" "$timeout_sec" "$gh" "$@" &
+    pid=$!
+    # `set +m` dès le pid capturé : le groupe (créé à l'instant par `set -m` ci-dessus) est déjà
+    # fixé, mais le mode moniteur fait aussi imprimer par bash des lignes « [1]+ Done/Exit » sur
+    # la sortie de ce job dès que `wait` le voit se terminer — du bruit qui polluerait le JSON lu
+    # par l'appelant. On le désactive juste après, avant le `wait`, uniquement pour ce filtrage.
+    set +m 2>/dev/null
+    wait "$pid"
+    rc=$?
+    # Filet de sécurité : le groupe créé par `set -m` pour ce job (pgid == $pid) peut encore
+    # contenir un descendant orphelin que `timeout` n'a pas réussi à joindre. On l'achève
+    # nous-mêmes avant de rendre la main, pour ne jamais laisser le tube de sortie ouvert plus
+    # longtemps que "$timeout_sec" + "$GH_KILL_AFTER_SEC".
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    exit "$rc"
+  )
 }
 
 find_new_run() {
