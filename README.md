@@ -144,6 +144,7 @@ opencode/tests/allowed-repos-test.sh
 - **Verdicts réels seulement.** `done_check.sh` exige, pour chaque agent de `OC_DONE_AGENTS` (entrée
   `done_agents`, défaut `Max`, ex. `Max,Silas`), une vraie tâche terminée dans le stockage opencode
   et la ligne `SUBAGENT done` du plugin ; un PASS écrit par l'agent principal ne compte pas.
+  Le verdict est lu par le CLI lifeos `LIFEOS/TOOLS/FullRunVerdict.ts` (source unique, même règle que le pipeline ; copie figée `/opt/fullrun-tools/FullRunVerdict.js`) : `pass` = code 0 et sortie `pass`, `unknown` (code 3) = inconclusif, CLI inutilisable = `a:verdict-cli`, jamais PASS.
 
 ## Limites et garde-fous
 

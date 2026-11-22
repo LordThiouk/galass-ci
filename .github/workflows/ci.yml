@@ -32,7 +32,22 @@ jobs:
           sudo install -m 0755 "$RUNNER_TEMP/age/age" /usr/local/bin/age
           sudo install -m 0755 "$RUNNER_TEMP/age/age-keygen" /usr/local/bin/age-keygen
           age --version
+      # done_check.sh lit le verdict via le CLI lifeos (source unique, LIFEOS/TOOLS/FullRunVerdict.ts) :
+      # les tests qui font tourner le vrai done_check.sh en ont besoin, avec bun.
+      - name: Checkout LifeOS (lecture seule, CLI de verdict)
+        uses: actions/checkout@v4
+        with:
+          repository: LordThiouk/lifeos
+          ref: main
+          token: ${{ secrets.LIFEOS_READ_TOKEN }}
+          path: lifeos
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
       - name: Tests opencode
+        env:
+          OC_VERDICT_CLI: ${{ github.workspace }}/lifeos/LIFEOS/TOOLS/FullRunVerdict.ts
         run: |
           set -euo pipefail
           failed=0
