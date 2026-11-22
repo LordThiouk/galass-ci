@@ -29,6 +29,19 @@ AGENTS="${OC_DONE_AGENTS:-$MAX_AGENT}"
 ONLY="${OC_DONE_ONLY:-}"
 DONE_VERIFY="${OC_DONE_VERIFY:-}"
 VALIDATE_ONLY="${OC_DONE_VALIDATE_ONLY:-}"
+# CLI de verdict lifeos (FullRunVerdict.ts : stdin -> pass|fail|unknown, exit 0/1/3), même source de vérité
+# que les autres consommateurs. Présent : il décide seul (exit 0 pass, 1 fail, tout autre code = inconclusif).
+# Absent (lifeos sans le CLI) : repli sur les règles python ci-dessous.
+VERDICT_CLI="${OC_VERDICT_CLI:-$HOME/.claude/LIFEOS/TOOLS/FullRunVerdict.ts}"
+VERDICT_RUNNER=""
+if [ -f "$VERDICT_CLI" ]; then
+  case "$VERDICT_CLI" in
+    *.ts) if command -v bun >/dev/null 2>&1; then VERDICT_RUNNER=bun; else VERDICT_CLI=""; fi ;;
+    *) [ -x "$VERDICT_CLI" ] || VERDICT_CLI="" ;;
+  esac
+else
+  VERDICT_CLI=""
+fi
 
 ko() { printf 'done_check=ko raison=%s\n' "$1"; exit 1; }
 [[ "$AGENTS" =~ ^[A-Za-z][A-Za-z0-9_-]{0,39}(,[A-Za-z][A-Za-z0-9_-]{0,39}){0,5}$ ]] || { printf 'done_check=ko raison=a:agents\n'; exit 1; }
@@ -45,8 +58,8 @@ last_commit=$(git -C "$REPO" log -1 --format=%ct -- . ':!MEMORY' ':!.fullrun' 2>
 [[ "$last_commit" =~ ^[0-9]+$ ]] || last_commit=0
 
 # --- a. stockage opencode (SQLite 1.19+ ou arbre JSON) ---
-storage=$(python3 - "$STORE" "$AGENTS" "$last_commit" <<'PY'
-import glob, json, os, re, sqlite3, sys
+storage=$(VERDICT_CLI="$VERDICT_CLI" VERDICT_RUNNER="$VERDICT_RUNNER" python3 - "$STORE" "$AGENTS" "$last_commit" <<'PY'
+import glob, json, os, re, sqlite3, subprocess, sys
 
 store, agents_arg, last_commit = sys.argv[1], sys.argv[2], int(sys.argv[3])
 agents = [a for a in agents_arg.split(',') if a]
@@ -150,6 +163,14 @@ def final_json(text):
 
 def verdict_of(out):
     """'pass' | 'fail' | None (inconclusif : aucun verdict structuré, ou dernière ligne VERDICT illisible)."""
+    cli = os.environ.get('VERDICT_CLI')
+    if cli:
+        cmd = ([os.environ['VERDICT_RUNNER']] if os.environ.get('VERDICT_RUNNER') else []) + [cli]
+        try:
+            r = subprocess.run(cmd, input=out, capture_output=True, text=True, timeout=30)
+        except Exception:
+            return None
+        return {0: 'pass', 1: 'fail'}.get(r.returncode)
     # BOM / espaces de largeur nulle ne sont pas des \s pour re : retirés avant l'ancrage.
     text = unwrap(out.strip().lstrip('\ufeff\u200b\u2060').strip())
     if not text:

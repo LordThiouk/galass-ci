@@ -271,5 +271,28 @@ out=$(call2 "$T/s12d" OC_DONE_REPO="$T/repo2"); [ "$out" = "done_check=ko raison
   && ok 12d "Max PASS antérieur à un commit de code postérieur : refusé (a:time)" || ko "12d [$out]"
 out=$(call2 "$T/s12d"); [ "$out" = "done_check=ok" ] && ok 12d2 "même stockage, dépôt sans commit postérieur : ok (le refus vient bien du commit)" || ko "12d2 [$out]"
 
+# 13. CLI de verdict (lifeos FullRunVerdict.ts, stdin -> pass|fail|unknown, exit 0/1/3) : source de vérité unique.
+# Stub : STUBPASS -> 0, STUBFAIL -> 1, sinon 3. Le texte « STUBPASS » seul n'est PAS un verdict pour le repli python.
+STUB="$T/verdict-stub.sh"
+cat >"$STUB" <<'SH'
+#!/usr/bin/env bash
+in=$(cat)
+case "$in" in
+  *STUBPASS*) echo pass; exit 0 ;;
+  *STUBFAIL*) echo fail; exit 1 ;;
+  *) echo unknown; exit 3 ;;
+esac
+SH
+chmod +x "$STUB"
+mkstore "$T/s13a" "opencode/v4-flash-free" 42 'conclusion STUBPASS' "$ENDP"
+out=$(call "$T/s13a" OC_VERDICT_CLI="$STUB"); [ "$out" = "done_check=ok" ] && ok 13a "CLI présent : exit 0 (pass) -> ok" || ko "13a [$out]"
+mkstore "$T/s13b" "opencode/v4-flash-free" 42 $'VERDICT: PASS\nSTUBFAIL' "$ENDP"
+out=$(call "$T/s13b" OC_VERDICT_CLI="$STUB"); [ "$out" = "done_check=ko raison=a:verdict" ] && ok 13b "CLI présent : exit 1 (fail) l'emporte sur un VERDICT: PASS python" || ko "13b [$out]"
+mkstore "$T/s13c" "opencode/v4-flash-free" 42 'VERDICT: PASS' "$ENDP"
+out=$(call "$T/s13c" OC_VERDICT_CLI="$STUB"); [ "$out" = "done_check=ko raison=a:inconclusif" ] && ok 13c "CLI présent : exit 3 (unknown) = inconclusif, pas de repli python" || ko "13c [$out]"
+out=$(call "$T/s13c" OC_VERDICT_CLI="$T/absent-cli"); [ "$out" = "done_check=ok" ] && ok 13d "CLI absent : repli sur les règles python (VERDICT: PASS -> ok)" || ko "13d [$out]"
+BADCLI="$T/verdict-bad.sh"; printf '#!/usr/bin/env bash\nexit 2\n' >"$BADCLI"; chmod +x "$BADCLI"
+out=$(call "$T/s13c" OC_VERDICT_CLI="$BADCLI"); [ "$out" = "done_check=ko raison=a:inconclusif" ] && ok 13e "CLI en erreur (exit 2) : inconclusif, jamais pass" || ko "13e [$out]"
+
 echo "résumé : $pass ok, $fail ko"
 [ "$fail" -eq 0 ]
