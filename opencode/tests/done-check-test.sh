@@ -386,13 +386,20 @@ else
   # Production : aucun env d'override, aucun mode test.
   callp() { local store="$1"; shift
     env -u OC_DONE_TEST_MODE -u OC_VERDICT_CLI -u OC_BUN -u OC_VERDICT_TIMEOUT \
-        OC_STORE_DIR="$store" OC_HOOKS_LOG="$HOOKS" OC_REPORT="$REPORT" OC_ISA="$ISA" OC_DONE_REPO="$R" "$@" bash "$DC" 2>/dev/null; }
+        OC_STORE_DIR="$store" OC_HOOKS_LOG="$HOOKS" OC_REPORT="$REPORT" OC_ISA="$ISA" OC_DONE_REPO="$R" "$@" bash "$DC" 2>>"$T/callp.err"; }
   # Injection comme le ferait $GITHUB_ENV : mode test + faux CLI + faux bun « toujours pass » dans l'environnement.
   printf '#!/bin/sh\ncat >/dev/null; echo pass; exit 0\n' >"$FAKE/bun-always-pass"; chmod +x "$FAKE/bun-always-pass"; : >"$FAKE/fake-cli.js"
   INJ=(OC_DONE_TEST_MODE=1 OC_VERDICT_CLI="$FAKE/fake-cli.js" OC_BUN="$FAKE/bun-always-pass")
   mkstore "$T/s14a" "opencode/v4-flash-free" 42 "$(env119 completed $'Revue terminée.\n{"status":"pass"}')" "$ENDP"
   mkstore "$T/s14b" "opencode/v4-flash-free" 42 "$(env119 completed 'VERDICT: FAIL')" "$ENDP"
   install_pt
+  # Diagnostic (jamais de secret : chemins, uid, modes) : si le chemin de production est refusé, dit pourquoi.
+  : >"$T/callp.err"; out=$(callp "$T/s14a")
+  if [ "$out" != "done_check=ok" ]; then
+    echo "diag 14 : sortie [$out] ; $(tr '\n' ' ' <"$T/callp.err")"
+    stat -c 'diag %n uid=%u gid=%g mode=%a type=%F' / /opt "$PT" "$PT"/* 2>&1 | sed 's/^/  /'
+    echo "diag uid=$(id -u) bun=$BUNBIN -> $(readlink -f "$BUNBIN") GITHUB_ACTIONS=${GITHUB_ACTIONS:-}"
+  fi
   out=$(callp "$T/s14a"); [ "$out" = "done_check=ok" ] && ok 14a "production : bundle réel + bun root, sans OC_VERDICT_CLI ni mode test : pass" || ko "14a [$out]"
   out=$(callp "$T/s14b"); [ "$out" = "done_check=ko raison=a:verdict" ] && ok 14b "production : VERDICT: FAIL refusé par le vrai bundle" || ko "14b [$out]"
   out=$(callp "$T/s14b" OC_BUN="$FAKE/bun-always-pass" OC_VERDICT_CLI="$FAKE/fake-cli.js"); [ "$out" = "done_check=ko raison=a:verdict" ] && ok 14c "hors mode test, OC_BUN/OC_VERDICT_CLI ignorés : le CLI root l'emporte (FAIL reste refusé)" || ko "14c [$out]"
