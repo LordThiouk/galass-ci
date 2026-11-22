@@ -352,6 +352,7 @@ done_check() {
   OC_REPORT="${OC_REPORT:-}" OC_DONE_REPO="$TARGET_DIR" \
   OC_ISA="${OC_ISA:-${OC_ISA_PATH:-}}" OC_DONE_VERIFY="${OC_DONE_VERIFY:-}" \
   OC_MAX_SUBAGENT="${OC_MAX_SUBAGENT:-Max}" OC_DONE_AGENTS="${OC_DONE_AGENTS:-}" \
+  OC_DONE_VALIDATE_ONLY="${OC_DONE_VALIDATE_ONLY:-}" \
     bash "$DONE_CHECK_BIN" 2>/dev/null | grep -qx 'done_check=ok'
 }
 maybe_finish() {

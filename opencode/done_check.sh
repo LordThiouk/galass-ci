@@ -12,7 +12,9 @@
 #   b. hooks.log contient `SUBAGENT done subagent_type=Max ok=true` postérieur au dernier commit
 #      (un `on-agent-stop` lancé à la main en bash ne compte pas : il n'écrit pas cette ligne) ;
 #   c. OC_DONE_VERIFY (fichier ou liste `;`) : toutes les commandes rendent 0 ;
-#   d. arbre propre (hors .fullrun/logs), REPORT.md présent, ISA pas en `phase: complete`.
+#   d. arbre propre (hors .fullrun/logs), REPORT.md présent, ISA pas en `phase: complete`
+#      (OC_DONE_VALIDATE_ONLY=1, et seulement la valeur exacte 1 : clôture déjà faite, ce seul contrôle
+#      « ISA pas complete » est sauté ; tous les autres contrôles restent).
 # Sortie : une seule ligne `done_check=ok` ou `done_check=ko raison=<a|b|c|d>:<détail>` (a:none:<Agent> = aucune tâche terminée pour cet agent de OC_DONE_AGENTS). Jamais de
 # texte du modèle, jamais de secret.
 set +x
@@ -26,6 +28,7 @@ MAX_AGENT="${OC_MAX_SUBAGENT:-Max}"
 AGENTS="${OC_DONE_AGENTS:-$MAX_AGENT}"
 ONLY="${OC_DONE_ONLY:-}"
 DONE_VERIFY="${OC_DONE_VERIFY:-}"
+VALIDATE_ONLY="${OC_DONE_VALIDATE_ONLY:-}"
 
 ko() { printf 'done_check=ko raison=%s\n' "$1"; exit 1; }
 [[ "$AGENTS" =~ ^[A-Za-z][A-Za-z0-9_-]{0,39}(,[A-Za-z][A-Za-z0-9_-]{0,39}){0,5}$ ]] || { printf 'done_check=ko raison=a:agents\n'; exit 1; }
@@ -56,8 +59,40 @@ agents = [a for a in agents_arg.split(',') if a]
 #  2. le JSON final {"verdict"} > {"status"} > {"result"} ne compte que s'il n'y a AUCUNE ligne VERDICT: ; c'est
 #     le dernier objet JSON du texte, à condition qu'il le termine. Un JSON ne contredit donc jamais une ligne VERDICT.
 # Rien de structuré, ou valeur inconnue : INCONCLUSIF — jamais PASS. Aucun motif FAIL/BLOCK sur le corps.
+# Enveloppe opencode (même règle que lifeos#22), déballée AVANT ces deux règles :
+#  - 1.19 : `<task id="…" state="completed">` [`<summary>…</summary>`] `<task_result>…</task_result>` `</task>`,
+#    ancrée aux deux bouts, attributs ` id=` puis ` state="completed"` exacts, rien d'autre ;
+#  - tout autre texte qui commence par `<task` hors `<task_result>` (état ≠ completed, <task_error>, attributs en double, dans le
+#    désordre, non quotés, data-state, texte après </task>, fausse fermeture…) : INCONCLUSIF, jamais de repli
+#    sur le texte brut (un VERDICT: FAIL ou un JSON pass cité dans l'enveloppe n'est pas une conclusion) ;
+#  - ancien format `task_id: …` (obligatoire) + `<task_result>…</task_result>` couvrant tout le texte : déballé ;
+#  - corps déballé, ou texte nu, qui contient encore une balise `<task…>`/`</task…>`/`<task_result>`/`<task_error>`
+#    (fausse fermeture, 2e bloc, enveloppe imbriquée, enveloppe après un préambule) : INCONCLUSIF ;
+#  - sinon le texte est lu tel quel.
 LINE = re.compile(r'^(?P<pre>.*?)VERDICT[ \t]*[:\uff1a](?P<rest>.*)$', re.I)
 VALUE = re.compile(r'[\W_]*(?P<w>PASS|FAIL|BLOCKED)\b[\W_]*(?:[(\[\u2014\u2013-].*)?$', re.I)
+ENV_1_19 = re.compile(r'\s*<task\s+id="[^"]*"\s+state="completed"\s*>\s*(?:<summary>[\s\S]*?</summary>\s*)?'
+                      r'<task_result>([\s\S]*?)</task_result>\s*</task>\s*')
+# Tout ce qui commence par `<task` sauf l'ancien `<task_result>` : `<task …>`, `<task_error>`, `<task/>`…
+ENV_SHAPED = re.compile(r'\s*<task(?!_result>)')
+# Ancien format : `task_id:` OBLIGATOIRE (un `<task_result>` seul reste lu en brut, comme avant).
+ENV_OLD = re.compile(r'\s*task_id:[^\n]*\n\s*<task_result>([\s\S]*)</task_result>\s*')
+# Une balise d'enveloppe n'importe où (ouvrante ou fermante) hors enveloppe conforme : inconclusif.
+ANY_TAG = re.compile(r'</?task(?:_result|_error)?(?=[\s>/])')
+
+
+def unwrap(text):
+    """Texte du sous-agent sans l'enveloppe opencode ; '' si l'enveloppe <task est invalide (inconclusif)."""
+    m = ENV_1_19.fullmatch(text) or (None if ENV_SHAPED.match(text) else ENV_OLD.fullmatch(text))
+    if m:
+        inner = m.group(1).strip()
+        # Fausse fermeture, 2e bloc ou enveloppe imbriquée dans le corps : inconclusif, jamais relu en brut.
+        return '' if ANY_TAG.search(inner) else inner
+    # Enveloppe invalide en tête (<task …>, <task_error>, <task/>…) ou balise d'enveloppe plus loin
+    # (préambule puis <task …>) : inconclusif. Texte nu sans balise : lu tel quel, comme avant.
+    if ENV_SHAPED.match(text) or ANY_TAG.search(text):
+        return ''
+    return text
 
 
 def word(raw):
@@ -115,7 +150,8 @@ def final_json(text):
 
 def verdict_of(out):
     """'pass' | 'fail' | None (inconclusif : aucun verdict structuré, ou dernière ligne VERDICT illisible)."""
-    text = out.strip()
+    # BOM / espaces de largeur nulle ne sont pas des \s pour re : retirés avant l'ancrage.
+    text = unwrap(out.strip().lstrip('\ufeff\u200b\u2060').strip())
     if not text:
         return None
     seen, last = False, None
@@ -291,7 +327,7 @@ if [ -n "$ISA" ]; then
   isa="$ISA"
   case "$isa" in /*) ;; *) isa="$REPO/$isa" ;; esac
   [ -f "$isa" ] || ko d:isa-absente
-  if grep -qE '^phase:[[:space:]]*complete[[:space:]]*$' "$isa"; then ko d:isa-complete; fi
+  if [ "$VALIDATE_ONLY" != 1 ] && grep -qE '^phase:[[:space:]]*complete[[:space:]]*$' "$isa"; then ko d:isa-complete; fi
 fi
 
 ok
