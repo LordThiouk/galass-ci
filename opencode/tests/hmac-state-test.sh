@@ -246,6 +246,54 @@ rm -f "$T/download_fail"
 grep -qx "status=missing" "$T/restore_out" && ok "restore_state : artefact introuvable ⇒ status=missing (toléré par la gate)" \
   || ko "status=missing absent : $(cat "$T/restore_out")"
 
+# --- H2 (B1). has_state=true ET téléchargement en échec (403, réseau, expiration) : ce n'est PAS une
+# absence légitime. Le step échoue (exit 1), status=failed, aucun état restauré, chaîne arrêtée ------
+touch "$T/download_fail"
+rc=$(run_restore GH_TOKEN=x ISA_STAMP_KEY="$REAL_KEY" PREV_RUN_ID=999 HAS_STATE_PREV=true)
+rm -f "$T/download_fail"
+[ "$rc" != 0 ] && ok "B1 : has_state=true + download KO ⇒ le step échoue (exit $rc), pas de cold start silencieux" \
+  || ko "B1 : has_state=true + download KO accepté (exit 0) : $(cat "$T/restore_log")"
+grep -qx "status=failed" "$T/restore_out" && ok "B1 : status=failed publié (la gate du step chain arrête la chaîne)" \
+  || ko "B1 : status=failed absent : $(cat "$T/restore_out")"
+! grep -qx "status=missing" "$T/restore_out" && ok "B1 : jamais status=missing quand l'état était attendu" \
+  || ko "B1 : status=missing publié à tort"
+state_restored && ko "B1 : un état a été restauré malgré l'échec" || ok "B1 : aucun état restauré"
+
+# has_state=false + téléchargement en échec : absence légitime (rien n'avait été publié) ⇒ missing, exit 0
+touch "$T/download_fail"
+rc=$(run_restore GH_TOKEN=x ISA_STAMP_KEY="$REAL_KEY" PREV_RUN_ID=999 HAS_STATE_PREV=false)
+rm -f "$T/download_fail"
+{ [ "$rc" = 0 ] && grep -qx "status=missing" "$T/restore_out"; } \
+  && ok "B1 : has_state=false + download KO ⇒ missing toléré (absence légitime)" \
+  || ko "B1 : has_state=false + download KO : rc=$rc $(cat "$T/restore_out")"
+
+# DELETE en échec : jamais avalé en silence (warning explicite + ligne de résumé), mais pas fatal
+cat >"$T/fakes/gh-del-ko" <<S
+#!/usr/bin/env bash
+for a in "\$@"; do case "\$a" in *DELETE*) exit 1 ;; esac; done
+exec "$T/fakes/gh" "\$@"
+S
+chmod +x "$T/fakes/gh-del-ko"
+cp "$T/fakes/gh" "$T/fakes/gh.real"; sed -i "s#exec \"$T/fakes/gh\"#exec \"$T/fakes/gh.real\"#" "$T/fakes/gh-del-ko"
+mv "$T/fakes/gh" "$T/fakes/gh.keep"; cp "$T/fakes/gh-del-ko" "$T/fakes/gh"
+reset_artifact
+rc=$(run_restore GH_TOKEN=x ISA_STAMP_KEY="$REAL_KEY" PREV_RUN_ID=999 HAS_STATE_PREV=true)
+mv "$T/fakes/gh.keep" "$T/fakes/gh"
+[ "$rc" = 0 ] && grep -q "suppression de l'artefact d'état .* en échec" "$T/restore_log" \
+  && grep -q "usage unique non garanti" "$T/restore_summary" \
+  && ok "B1 : DELETE en échec ⇒ warning explicite + résumé (plus avalé en silence)" \
+  || ko "B1 : DELETE en échec silencieux : rc=$rc log=$(cat "$T/restore_log")"
+
+# Statique : actions: write déclaré (sans lui, DELETE répond 403)
+python3 - "$WF" <<'PY' || fail=1
+import sys, yaml
+y = yaml.safe_load(open(sys.argv[1]))
+perms = y["permissions"]
+assert perms.get("actions") == "write", "permissions.actions doit valoir write (restore_state supprime l'artefact) : %r" % perms
+assert perms.get("contents") == "read", "contents doit rester read : %r" % perms
+print("OK   B1 : permissions = contents: read + actions: write")
+PY
+
 # --- F. save_state, ISA_STAMP_KEY absente : échec explicite (exit 1), jamais de signature produite,
 # jamais la clé affichée (vide ici, donc rien à masquer, mais le message ne doit rien contenir de
 # sensible) -------------------------------------------------------------------------------------------

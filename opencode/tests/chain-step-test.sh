@@ -351,6 +351,69 @@ for old in ("hf_corpus", "chain_phase", "chain_count", "prompt_path_build", "pre
 print("OK   chain_enabled=false : steps de chaînage ignorés, timeouts longs, %d inputs (≤ 25), défaut false" % len(ins))
 PY
 
+
+# --- B1 : restore_state=failed (has_state=true, téléchargement KO) ⇒ arrêt, zéro dispatch ------------
+run_chain OC_STOP=ok CHECK_OUTCOME=success PUSH_OUTCOME=success IN_PREV_RUN_ID=4242 \
+  RESTORE_STATE_OUTCOME=success RESTORE_STATE_STATUS=failed
+out_eq block true && [ ! -f "$T/gh_dispatch_args" ] && grep -q "has_state=true" "$T/out" \
+  && ok "B1 : restore_state=failed ⇒ block=true, zéro dispatch, raison has_state" || ko "B1 failed : $(cat "$T/out")"
+run_chain OC_STOP=ok CHECK_OUTCOME=success PUSH_OUTCOME=success IN_PREV_RUN_ID=4242 \
+  RESTORE_STATE_OUTCOME=failure RESTORE_STATE_STATUS=failed
+out_eq block true && ok "B1 : step restore_state en échec (exit 1) ⇒ block=true" || ko "B1 outcome failure : $(cat "$T/out")"
+
+# --- B1 : has_state transmis dans chain_state (true quand ce lien a publié un état) -------------------
+run_chain OC_STOP=ok CHECK_OUTCOME=success PUSH_OUTCOME=success SAVE_STATE_OUTCOME=success HAS_STATE=true PUBLISH_STATE_OUTCOME=success
+args=$(cat "$T/gh_dispatch_args" 2>/dev/null || echo "")
+[[ "$args" == *'"has":"true"'* ]] && ok "B1 : chain_state.has=true transmis quand l'état est publié" || ko "has=true absent : $args"
+run_chain OC_STOP=ok CHECK_OUTCOME=success PUSH_OUTCOME=success
+args=$(cat "$T/gh_dispatch_args" 2>/dev/null || echo "")
+[[ "$args" == *'"has":"false"'* ]] && ok "B1 : chain_state.has=false quand rien n'est publié" || ko "has=false absent : $args"
+
+# --- M2 : valeurs de next inattendues ⇒ arrêt avec raison, jamais un lien sans cible -----------------
+chain_next() { # $1 = phase, $2 = next ; attend un arrêt
+  printf '{"exit":"suite_a_faire","reason":"ok","next":"%s"}\n' "$2" > "$T/bun_output.json"
+  run_chain OC_STOP=ok CHECK_OUTCOME=success PUSH_OUTCOME=success IN_CHAIN_PHASE="$1"
+}
+for pn in "plan:" "plan:9" "plan:t2" "plan:5" "close:" "close:4" "close:t2" "build:" "build:a;b" "verify:" "verify:\$(x)"; do
+  ph=${pn%%:*}; nx=${pn#*:}
+  chain_next "$ph" "$nx"
+  if out_eq block true && [ ! -f "$T/gh_dispatch_args" ] && grep -q "reason=.*unit --isa" "$T/out"; then
+    ok "M2 : phase=$ph next='$nx' ⇒ arrêt avec raison, zéro dispatch"
+  else ko "M2 : phase=$ph next='$nx' non arrêté : $(cat "$T/out") $(cat "$T/gh_dispatch_args" 2>/dev/null)"; fi
+done
+for pn in "plan:1" "plan:2" "plan:3" "close:6" "close:7"; do
+  ph=${pn%%:*}; nx=${pn#*:}
+  chain_next "$ph" "$nx"
+  out_eq continue true && ok "M2 : phase=$ph next=$nx ⇒ lien suivant (phase inchangée)" || ko "M2 : phase=$ph next=$nx refusé : $(cat "$T/out")"
+done
+chain_next plan 4; args=$(cat "$T/gh_dispatch_args" 2>/dev/null)
+[[ "$args" == *'"phase":"build"'* ]] && ok "M2 : plan next=4 ⇒ phase build" || ko "plan 4 : $args"
+chain_next build 5; args=$(cat "$T/gh_dispatch_args" 2>/dev/null)
+[[ "$args" == *'"phase":"verify"'* ]] && ok "M2 : build next=5 ⇒ phase verify" || ko "build 5 : $args"
+chain_next verify 6; args=$(cat "$T/gh_dispatch_args" 2>/dev/null)
+[[ "$args" == *'"phase":"close"'* ]] && ok "M2 : verify next=6 ⇒ phase close" || ko "verify 6 : $args"
+printf '%s\n' '{"exit":"suite_a_faire","reason":"ok","next":"t2"}' > "$T/bun_output.json"
+
+# --- m1 : reason issu de unit --isa assaini (jeton masqué, newline replié, « :: » échappé) -----------
+rtok="ghp_$(head -c 64 /dev/urandom | base64 -w0 | tr -dc 'A-Za-z0-9' | head -c 36)"
+python3 - "$T/bun_output.json" "$rtok" <<'PY'
+import json, sys
+json.dump({"exit": "echec", "reason": "boom " + sys.argv[2] + "\n::warning::injecte\nsuite"}, open(sys.argv[1], "w"))
+PY
+run_chain OC_STOP=ok CHECK_OUTCOME=success PUSH_OUTCOME=success
+out_eq block true && ok "m1 : echec avec reason hostile ⇒ block=true" || ko "m1 : $(cat "$T/out")"
+! grep -qF "$rtok" "$T/out" "$T/err" "$T/summary" && ok "m1 : jeton du reason absent de GITHUB_OUTPUT, du log et du résumé" || ko "m1 : jeton du reason non masqué"
+[ "$(grep -c '^reason=' "$T/out")" = 1 ] && ok "m1 : GITHUB_OUTPUT : une seule ligne reason= (aucune injection de sortie)" || ko "m1 : lignes reason multiples : $(cat "$T/out")"
+! grep -q '^::warning::injecte' "$T/err" "$T/out" && ok "m1 : aucune workflow command injectée par reason" || ko "m1 : injection :: via reason"
+printf '%s\n' '{"exit":"suite_a_faire","reason":"ok","next":"t2"}' > "$T/bun_output.json"
+
+# --- m4 : isa_path invalide au step chain (jamais joint à TARGET_DIR sans validation) ---------------
+for badisa in "../../etc/passwd" "MEMORY/WORK/../x/ISA.md" "MEMORY/WORK/x/ISA.md;id" "/abs/ISA.md"; do
+  run_chain OC_STOP=ok CHECK_OUTCOME=success PUSH_OUTCOME=success OC_ISA_PATH="$badisa"
+  { out_eq block true && [ ! -f "$T/gh_dispatch_args" ] && [ ! -f "$T/bun_called" ]; } \
+    && ok "m4 : isa_path « $badisa » refusé au step chain (bun non appelé)" || ko "m4 : « $badisa » accepté : $(cat "$T/out")"
+done
+
 # --- step « guard » : même hors-un (chain_count == chain_max) bloqué dès la garde, avant le step oc,
 # et le motif ^[0-9]{1,3}$ plafonne déjà chain_count à 999 (le second contrôle -gt 999 retiré, mort,
 # ne change rien d'observable) -----------------------------------------------------------------------
@@ -367,7 +430,7 @@ run_guard() {
   env -i PATH="/usr/bin:/bin" GITHUB_OUTPUT="$T/gout" GITHUB_ENV="$T/genv" RUNNER_TEMP="$T" \
     IN_BRANCH=feat-x IN_JOB=job1 IN_PROMPT=prompts:p.md IN_LIFEOS_REF=main \
     OC_ISA_PATH="MEMORY/WORK/x/ISA.md" IN_IDLE_MIN=20 IN_AGENT_IDLE_MIN= IN_START_STEP= \
-    IN_DONE_AGENTS=Max IN_WIP_PUSH_MIN=30 IN_CHAIN_PHASE=build IN_PREV_RUN_ID= IN_NEXT= \
+    IN_DONE_AGENTS=Max IN_WIP_PUSH_MIN=30 IN_CHAIN_PHASE=build IN_PREV_RUN_ID= IN_NEXT= IN_HAS_STATE= \
     IN_PROMPT_BUILD=prompts:b.md IN_PROMPT_VERIFY=prompts:v.md IN_PROMPT_CLOSE=prompts:c.md \
     OC_MODEL_MAIN=opencode/m-free OC_MODEL_MAX=opencode/x-free OC_MODEL_FALLBACK=opencode/f-free \
     OC_MODEL_CHAIN= "$@" bash "$T/guard.sh" >"$T/guard_out" 2>&1
@@ -383,5 +446,39 @@ run_guard IN_CHAIN_ENABLED=true IN_CHAIN_COUNT=1000 IN_CHAIN_MAX=20
 rc=$?
 [ "$rc" -ne 0 ] && grep -q "chain_count invalide" "$T/guard_out" && ok "garde : chain_count=1000 toujours refusé (motif à 3 chiffres, sans le contrôle mort)" \
   || ko "garde : chain_count=1000 : $(cat "$T/guard_out")"
+
+# --- M3 : tests négatifs du garde — chacun doit ÉCHOUER dès le garde, avec la bonne raison ----------
+guard_must_fail() { # $1 = motif attendu dans la sortie ; $2.. = variables d'env
+  local pat="$1"; shift
+  : >"$T/gout"; : >"$T/genv"
+  run_guard IN_CHAIN_ENABLED=true IN_CHAIN_COUNT=1 IN_CHAIN_MAX=20 "$@"
+  local rc=$?
+  if [ "$rc" -ne 0 ] && grep -q "$pat" "$T/guard_out"; then ok "M3 garde refuse : $*"; else ko "M3 garde accepte/mauvaise raison (rc=$rc) : $* : $(cat "$T/guard_out")"; fi
+}
+guard_must_fail "prompt_path invalide" IN_PROMPT='prompts:../../x'
+guard_must_fail "prompt_path invalide" IN_PROMPT='prompts:a/../b.md'
+guard_must_fail "prompt_path invalide" IN_PROMPT='/etc/passwd'
+guard_must_fail "prompt_path_build" IN_PROMPT_BUILD='prompts:../../x'
+guard_must_fail "prompt_path_build" IN_PROMPT_CLOSE='ftp:x.md'
+guard_must_fail "next invalide" IN_NEXT='t2;id'
+guard_must_fail "next invalide" IN_NEXT='t2`id`'
+guard_must_fail "next invalide" IN_NEXT='$(id)'
+guard_must_fail "chain_phase invalide" IN_CHAIN_PHASE=deploy
+guard_must_fail "chain_phase invalide" IN_CHAIN_PHASE=
+guard_must_fail "chain_enabled invalide" IN_CHAIN_ENABLED=yes
+guard_must_fail "chain_enabled invalide" IN_CHAIN_ENABLED=1
+guard_must_fail "chain_max invalide" IN_CHAIN_MAX=0
+guard_must_fail "chain_max invalide" IN_CHAIN_MAX=101
+guard_must_fail "chain_max invalide" IN_CHAIN_MAX=abc
+guard_must_fail "chain_max invalide" IN_CHAIN_MAX=
+guard_must_fail "chain_count invalide" IN_CHAIN_COUNT=-1
+guard_must_fail "prev_run_id invalide" IN_PREV_RUN_ID='12;id'
+guard_must_fail "chain_state.has invalide" IN_HAS_STATE=maybe
+guard_must_fail "isa_path invalide" OC_ISA_PATH='MEMORY/WORK/../x/ISA.md'
+guard_must_fail "isa_path invalide" OC_ISA_PATH='../ISA.md'
+# et le cas sain reste accepté (le garde ne refuse pas tout)
+: >"$T/gout"; : >"$T/genv"
+run_guard IN_CHAIN_ENABLED=true IN_CHAIN_COUNT=1 IN_CHAIN_MAX=20 IN_NEXT=t2 IN_HAS_STATE=true IN_PREV_RUN_ID=77
+[ $? -eq 0 ] && ok "M3 : entrées saines acceptées par le garde" || ko "M3 : cas sain refusé : $(cat "$T/guard_out")"
 
 exit $fail
