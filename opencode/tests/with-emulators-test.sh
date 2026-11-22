@@ -549,4 +549,62 @@ printf '%s' "$wrongref_out" | grep -q 'ref_erronee' || ko "divergence list/view 
 printf '%s' "$wrongref_out" | grep -q 'e2e : succès' && ko "divergence list/view : lue à tort comme un succès de test (régression exacte signalée) : $wrongref_out"
 ok "régression : list=feat/multi mais view=main (run réutilisé/API en retard) → FAIL mauvais ref/ref_erronee, jamais lu comme un succès"
 
+# --- Chaînage : un run e2e en vol est REPRIS par le lien suivant, jamais relancé en double -----------
+cat > "$tmp/mock-gh-resume" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${EMU_E2E_GH_LOG:?}"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  api)
+    path=""
+    for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
+    case "$path" in repos/LordThiouk/*/branches/*) exit 0 ;; *) exit 1 ;; esac
+    ;;
+  run)
+    case "${1:-}" in
+      view) printf '%s\n' '{"status":"completed","conclusion":"success","url":"https://example.test/4242","displayTitle":"e2e","headBranch":"feat/multi"}' ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+MOCK
+chmod +x "$tmp/mock-gh-resume"
+: > "$tmp/gh.log"
+printf '4242\n' > "$tmp/emu-resume"
+set +e
+out=$(EMU_E2E_GH="$tmp/mock-gh-resume" OC_BRANCH=feat/multi EMU_E2E_RESUME_FILE="$tmp/emu-resume" \
+  EMU_E2E_INFLIGHT_FILE="$tmp/emu-run" EMU_E2E_TIMEOUT_SEC=5 EMU_E2E_POLL_SEC=0 "$sh" run 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || ko "reprise : rc=$rc : $out"
+printf '%s' "$out" | grep -q 'reprise du run e2e 4242' || ko "reprise : message absent : $out"
+printf '%s' "$out" | grep -q 'verdict=success' || ko "reprise : verdict absent : $out"
+grep -q '^workflow run' "$tmp/gh.log" && ko "reprise : un nouveau run a été déclenché (double lancement) : $(cat "$tmp/gh.log")"
+grep -q '^run list' "$tmp/gh.log" && ko "reprise : run list appelé (aucune recherche de nouveau run attendue)"
+[ ! -f "$tmp/emu-resume" ] || ko "reprise : fichier de reprise non consommé"
+[ ! -f "$tmp/emu-run" ] || ko "reprise : run terminé mais marqueur en vol non effacé"
+ok "chaînage : run e2e 4242 repris (aucun workflow run), marqueur de reprise consommé, marqueur en vol effacé au verdict"
+
+# Sans reprise : le run déclenché est inscrit comme « en vol » tant qu'il n'a pas de verdict (timeout)
+: > "$tmp/gh.log"; rm -f "$tmp/emu-run"
+set +e
+out=$(EMU_E2E_GH="$tmp/mock-gh-hang" OC_BRANCH=feat/multi EMU_E2E_RESUME_FILE="$tmp/none" \
+  EMU_E2E_INFLIGHT_FILE="$tmp/emu-run" EMU_E2E_TIMEOUT_SEC=1 EMU_E2E_POLL_SEC=0 "$sh" run 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 124 ] || ko "en vol : timeout attendu (124), obtenu $rc : $out"
+[ "$(tr -d '[:space:]' < "$tmp/emu-run" 2>/dev/null)" = 9 ] \
+  || ko "en vol : le run 9 non terminé devait rester inscrit (lu : $(cat "$tmp/emu-run" 2>/dev/null))"
+ok "chaînage : run non terminé à la fin du lien ⇒ id inscrit (transmis au lien suivant)"
+
+# Fichier de reprise corrompu : ignoré, jamais injecté ; run normal (déclenchement)
+printf 'abc; rm -rf /\n' > "$tmp/emu-resume"; : > "$tmp/gh.log"
+out=$(EMU_E2E_GH="$tmp/mock-gh-ok" OC_BRANCH=feat/multi EMU_E2E_RESUME_FILE="$tmp/emu-resume" \
+  EMU_E2E_INFLIGHT_FILE="$tmp/emu-run" "$sh" run 2>&1) || true
+printf '%s' "$out" | grep -q 'reprise du run e2e' && ko "reprise corrompue : prise en compte à tort : $out"
+grep -q '^workflow run' "$tmp/gh.log" || ko "reprise corrompue : aucun déclenchement normal"
+ok "chaînage : fichier de reprise non numérique ignoré (run normal)"
+
 echo "tous les contrôles with_emulators sont passés"

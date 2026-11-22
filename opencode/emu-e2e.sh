@@ -18,6 +18,12 @@ set +x
 FROZEN="/opt/fullrun-tools/emu-e2e.sh"
 CANON_STATE="/opt/fullrun-tools/emu-e2e.state"
 CANON_TOKEN="/opt/fullrun-live/emu-e2e.token"
+# Chaînage : un run e2e peut durer plus qu'un lien (jobs courts). INFLIGHT = id du run lancé et pas
+# encore terminé (lu par le step chain, transmis au lien suivant dans chain_state) ; RESUME = id
+# restauré au démarrage du lien suivant (root 0600) : « run » reprend alors le sondage de CE run au
+# lieu d'en relancer un. Fichiers root, hors de portée d'opencode.
+EMU_INFLIGHT_FILE="${EMU_E2E_INFLIGHT_FILE:-/opt/fullrun-live/emu-run}"
+EMU_RESUME_FILE="${EMU_E2E_RESUME_FILE:-/opt/fullrun-live/emu-resume}"
 EMU_OWNER="LordThiouk"
 EMU_REPO_NAME="galass-emu-actions-pub"
 EMU_REPO="${EMU_OWNER}/${EMU_REPO_NAME}"
@@ -428,12 +434,21 @@ run_e2e() {
     echo "note : ${EMU_REPO_NAME} n'a pas la branche ${OC_BRANCH} sur GitHub ; fallback ${FALLBACK_REF}."
   fi
 
+  resume_id=""
+  if [ -f "$EMU_RESUME_FILE" ]; then
+    resume_id=$(tr -d '[:space:]' < "$EMU_RESUME_FILE" 2>/dev/null || true)
+    rm -f "$EMU_RESUME_FILE"
+    [[ "$resume_id" =~ ^[0-9]{1,20}$ ]] || resume_id=""
+  fi
+
   since=$(iso_minus 15)
   # --ref="$emu_ref" : sans lui, le dispatch exécute toujours le harnais (e2e/*.sh, workflow) de la
   # branche par défaut du dépôt emu, même quand rider_ref/driver_ref pointent la branche de travail
   # (run 44238051634 : head_branch=main, échec immédiat sur du code que la branche de travail ne contient
   # plus). --ref ne change pas rider_ref/driver_ref, qui restent des inputs du workflow.
-  if ! gh_cmd workflow run "$EMU_WORKFLOW" -R "$EMU_REPO" --ref "$emu_ref" \
+  if [ -n "$resume_id" ]; then
+    echo "reprise du run e2e ${resume_id} (lien précédent) : aucun nouveau déclenchement"
+  elif ! gh_cmd workflow run "$EMU_WORKFLOW" -R "$EMU_REPO" --ref "$emu_ref" \
       -f "rider_ref=${rider_ref}" -f "driver_ref=${driver_ref}" \
       -f "model=${EMU_E2E_MODEL}"; then
     fail "échec du déclenchement : le jeton GALASS_TOKEN a-t-il le droit actions:write sur ${EMU_REPO} ?"
@@ -442,7 +457,11 @@ run_e2e() {
   deadline=$(( $(date +%s) + EMU_E2E_TIMEOUT_SEC ))
   run_id=""
   run_branch=""
-  while [ "$(date +%s)" -lt "$deadline" ]; do
+  if [ -n "$resume_id" ]; then
+    # le head_branch est revérifié à chaque lecture par la boucle de sondage plus bas
+    run_id="$resume_id"; run_branch="$emu_ref"
+  fi
+  while [ -z "$resume_id" ] && [ "$(date +%s)" -lt "$deadline" ]; do
     # find_new_run filtre désormais par branche (emu_ref) : un run plus récent
     # mais sur une autre branche (ex. un autre job sur main) ne doit jamais être
     # pris pour celui qu'on vient de déclencher, s'il en existe un sur la bonne.
@@ -459,6 +478,7 @@ run_e2e() {
   done
   [ -n "$run_id" ] || fail "aucun run e2e trouvé avant le délai sur la branche ${emu_ref} (déclenchement peut-être refusé ou mauvais ref)"
   RUN_ID_CUR="$run_id"
+  printf '%s\n' "$run_id" > "$EMU_INFLIGHT_FILE" 2>/dev/null || true
   echo "run=${run_id} https://github.com/${EMU_REPO}/actions/runs/${run_id}"
 
   # Première garde, bon marché (aucun appel gh : headBranch vient du `run list` déjà fait
@@ -532,6 +552,7 @@ for k in ("status","conclusion","url","headBranch"):
     exit 124
   fi
 
+  rm -f "$EMU_INFLIGHT_FILE" 2>/dev/null || true
   echo "verdict=${conclusion:-$status} status=${status} run=${run_id}"
   [ -n "$url" ] && echo "url=${url}"
 
