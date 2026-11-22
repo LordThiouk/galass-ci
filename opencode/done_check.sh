@@ -13,7 +13,9 @@
 #   b. hooks.log contient `SUBAGENT done subagent_type=Max ok=true` postérieur au dernier commit
 #      (un `on-agent-stop` lancé à la main en bash ne compte pas : il n'écrit pas cette ligne) ;
 #   c. OC_DONE_VERIFY (fichier ou liste `;`) : toutes les commandes rendent 0 ;
-#   d. arbre propre (hors .fullrun/logs), REPORT.md présent, ISA pas en `phase: complete`.
+#   d. arbre propre (hors .fullrun/logs), REPORT.md présent, ISA pas en `phase: complete`
+#      (OC_DONE_VALIDATE_ONLY=1, valeur exacte 1 seulement : clôture déjà faite, ce seul contrôle « ISA pas
+#      complete » est sauté ; tous les autres restent exigés).
 # Sortie : une seule ligne `done_check=ok` ou `done_check=ko raison=<a|b|c|d>:<détail>` (a:none:<Agent> = aucune tâche terminée pour cet agent de OC_DONE_AGENTS). Jamais de
 # texte du modèle, jamais de secret.
 set +x
@@ -252,7 +254,7 @@ if [ -n "$ISA" ]; then
   isa="$ISA"
   case "$isa" in /*) ;; *) isa="$REPO/$isa" ;; esac
   [ -f "$isa" ] || ko d:isa-absente
-  if grep -qE '^phase:[[:space:]]*complete[[:space:]]*$' "$isa"; then ko d:isa-complete; fi
+  if [ "${OC_DONE_VALIDATE_ONLY:-}" != 1 ] && grep -qE '^phase:[[:space:]]*complete[[:space:]]*$' "$isa"; then ko d:isa-complete; fi
 fi
 
 ok

@@ -105,6 +105,12 @@ rm -f "$R/pas-commite.txt"
 printf -- '---\nphase: complete\n---\n' >"$ISA"
 out=$(call "$T/s6"); [ "$out" = "done_check=ko raison=d:isa-complete" ] && ok 9 "ISA close refusée" || ko "9 [$out]"
 printf -- '---\nphase: climbing\n---\n' >"$ISA"
+# 9b. validate_only (OC_DONE_VALIDATE_ONLY=1) : seul d:isa-complete est sauté ; le reste reste exigé
+printf -- '---\nphase: complete\n---\n' >"$ISA"
+out=$(call "$T/s6" OC_DONE_VALIDATE_ONLY=1); [ "$out" = "done_check=ok" ] && ok 9b "validate_only : ISA close acceptée" || ko "9b [$out]"
+out=$(call "$T/s6" OC_DONE_VALIDATE_ONLY=true); [ "$out" = "done_check=ko raison=d:isa-complete" ] && ok 9c "validate_only : seule la valeur exacte 1 compte" || ko "9c [$out]"
+out=$(call "$T/s3" OC_DONE_VALIDATE_ONLY=1); [ "$out" = "done_check=ko raison=a:tokens" ] && ok 9d "validate_only : les contrôles a restent exigés" || ko "9d [$out]"
+printf -- '---\nphase: climbing\n---\n' >"$ISA"
 
 # 9b. magasin absent -> a:stockage : un chemin faux n'est pas « aucune tâche Max » (run F4).
 out=$(call "$T/absent")

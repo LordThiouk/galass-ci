@@ -94,6 +94,11 @@ on:
         required: false
         type: boolean
         default: false
+      validate_only:
+        description: "Clôture déjà faite (ISA phase: complete) : relance seulement la validation des verdicts ; saute uniquement le contrôle d:isa-complete du validateur de fin"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -696,6 +701,9 @@ jobs:
           OC_IDLE_MIN: ${{ inputs.idle_minutes }}
           OC_AGENT_IDLE_MIN: ${{ inputs.agent_idle_minutes }}
           OC_DONE_AGENTS: ${{ inputs.done_agents }}
+          # Sans lui, le moniteur ne conclut jamais sur une ISA déjà close : reprises puis rc 127 (stop=tour),
+          # PR sautées. Seul d:isa-complete est sauté ; PASS réel de Max, hooks, vérificateurs, arbre restent exigés.
+          OC_DONE_VALIDATE_ONLY: ${{ inputs.validate_only == true && '1' || '' }}
           OC_JOB_T0: ${{ steps.guard.outputs.t0 }}
           # Doit rester égal à timeout-minutes du job (350) ; marge de push : 15 min.
           OC_JOB_TIMEOUT_MIN: "350"
@@ -770,6 +778,7 @@ jobs:
           OC_OUTCOME: ${{ steps.oc.outcome }}
           OC_STOP: ${{ steps.oc.outputs.stop }}
           OC_IDLE_MIN: ${{ inputs.idle_minutes }}
+          OC_DONE_VALIDATE_ONLY: ${{ inputs.validate_only == true && '1' || '' }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Valeurs du step > $GITHUB_ENV : opencode ne peut ni changer la branche, ni la base,
@@ -1073,7 +1082,8 @@ jobs:
             echo 'if [ -f LIFEOS/TOOLS/ISATool.ts ]; then bun LIFEOS/TOOLS/ISATool.ts verify "$isa"; fi'
           } >"$vf"
           dc_out=$(OC_DONE_VERIFY="$vf" OC_DONE_REPO="$TARGET_DIR" OC_ISA="${OC_ISA_PATH:-}" \
-                   OC_MAX_SUBAGENT=Max OC_DONE_AGENTS="$IN_DONE_AGENTS" "$T/done_check.sh" 2>/dev/null | head -n1) || true
+                   OC_MAX_SUBAGENT=Max OC_DONE_AGENTS="$IN_DONE_AGENTS" \
+                   OC_DONE_VALIDATE_ONLY="${OC_DONE_VALIDATE_ONLY:-}" "$T/done_check.sh" 2>/dev/null | head -n1) || true
           rm -f "$vf"
           case "$dc_out" in
             "done_check=ok")
