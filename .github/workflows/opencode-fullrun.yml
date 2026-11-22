@@ -468,10 +468,15 @@ jobs:
           curl -sSfL -o "$f" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           echo "${GITLEAKS_SHA256}  $f" | sha256sum -c --quiet
           mkdir -p "$RUNNER_TEMP/gl" && tar -xzf "$f" -C "$RUNNER_TEMP/gl" gitleaks
+          # /opt est en 0777 sur les runners hébergés (vu dans le log CI de galass-ci#14) : l'agent, qui tourne sous le même
+          # UID que ce step, pourrait renommer /opt/fullrun-tools et y mettre sa propre copie. On retire l'écriture
+          # groupe/autres ET on échoue en dur si elle subsiste (done_check.sh exige la même chose de chaque ancêtre).
+          sudo chmod go-w /opt
+          [ -z "$(find /opt -maxdepth 0 -perm /022)" ] || { echo "::error::/opt reste inscriptible par le groupe ou les autres"; exit 1; }
           sudo install -d -o root -g root -m 0755 "$T" "$L"
           sudo install -o root -g root -m 0755 "$RUNNER_TEMP/gl/gitleaks" "$CI_DIR/opencode/redact-log.sh" \
             "$CI_DIR/opencode/leaklog.sh" "$CI_DIR/opencode/livelog.sh" "$CI_DIR/opencode/progress.sh" \
-            "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" "$CI_DIR/opencode/checkpoint.sh" \
+            "$CI_DIR/opencode/wippush.sh" "$CI_DIR/opencode/done_check.sh" "$CI_DIR/opencode/done-check-call.sh" "$CI_DIR/opencode/checkpoint.sh" \
             "$CI_DIR/opencode/extra-repos.sh" "$CI_DIR/opencode/emu-e2e.sh" "$T/"
           # Sourcé par extra-repos.sh, wippush.sh et livelog.sh depuis $T (pas le cwd).
           sudo install -o root -g root -m 0644 "$CI_DIR/opencode/allowed-repos.sh" "$CI_DIR/opencode/log-recipient.txt" "$CI_DIR/opencode/autosave-deny.txt" "$T/"
@@ -1090,9 +1095,9 @@ jobs:
             echo 'if [ -f LIFEOS/TOOLS/CheckCompleteness.ts ]; then bun LIFEOS/TOOLS/CheckCompleteness.ts "$isa"; fi'
             echo 'if [ -f LIFEOS/TOOLS/ISATool.ts ]; then bun LIFEOS/TOOLS/ISATool.ts verify "$isa"; fi'
           } >"$vf"
-          dc_out=$(env -u OC_DONE_TEST_MODE -u OC_VERDICT_CLI -u OC_BUN -u OC_VERDICT_TIMEOUT OC_DONE_VERIFY="$vf" OC_DONE_REPO="$TARGET_DIR" OC_ISA="${OC_ISA_PATH:-}" \
+          dc_out=$(. "$T/done-check-call.sh"; OC_DONE_VERIFY="$vf" OC_DONE_REPO="$TARGET_DIR" OC_ISA="${OC_ISA_PATH:-}" \
                    OC_MAX_SUBAGENT=Max OC_DONE_AGENTS="$IN_DONE_AGENTS" \
-                   OC_DONE_VALIDATE_ONLY="${OC_DONE_VALIDATE_ONLY:-}" "$T/done_check.sh" 2>/dev/null | head -n1) || true
+                   OC_DONE_VALIDATE_ONLY="${OC_DONE_VALIDATE_ONLY:-}" fullrun_done_check "$T/done_check.sh" 2>/dev/null | head -n1) || true
           rm -f "$vf"
           case "$dc_out" in
             "done_check=ok")
