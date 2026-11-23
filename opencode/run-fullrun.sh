@@ -44,7 +44,8 @@
 # OC_ERROR_IDLE_SEC, OC_SUBAGENT_IDLE_SEC, OC_STALL_RESUMES, OC_CONTINUE_PROBE_SEC, OC_MODEL_CHAIN,
 # OC_MODEL_FALLBACK (compat), OC_STORE_DIR, OC_AGENT_DIR, OC_INTERNAL_LOG,
 # OC_INTERNAL_LOG_DIR, OC_HOOKS_LOG, OC_DONE_VERIFY, OC_ISA/OC_ISA_PATH, OC_REPORT,
-# OC_DONE_CHECK_SEC, OC_DONE_IDLE_SEC, OC_DONE_CHECK_BIN, OC_IDLE_CPU.
+# OC_DONE_CHECK_SEC, OC_DONE_IDLE_SEC, OC_DONE_CHECK_BIN, OC_IDLE_CPU, OC_START_STEP,
+# OC_STOP_AFTER_STEP, OC_TARGET_AGENT.
 # Statut ($OC_LOG.status) : main_rc, stall_resume, fallback=<modèle>, stall_rc, new_session,
 # new_rc, error=<type>, subagent_timeout, done_check=ok,
 # arret=max_pass|tour-fini|plafond|silence|vide|annulation.
@@ -78,6 +79,20 @@ if [ -n "${OC_START_STEP:-}" ]; then
   [[ "$OC_START_STEP" =~ ^(scaffold|completeness_pre|vera|serena|build|verify|max|close|[0-7])$ ]] \
     || { echo "OC_START_STEP invalide" >&2; exit 90; }
   export FULLRUN_START_STEP="$OC_START_STEP"
+fi
+# Même principe pour stop_after_step (s'arrête après cette étape, sans dispatcher la suite) et
+# target_agent (limite ce job à un seul agent de l'étape visée) : transmis par l'environnement
+# d'opencode, jamais modifiables par l'agent lui-même.
+unset FULLRUN_STOP_AFTER_STEP FULLRUN_TARGET_AGENT
+if [ -n "${OC_STOP_AFTER_STEP:-}" ]; then
+  [[ "$OC_STOP_AFTER_STEP" =~ ^(scaffold|completeness_pre|vera|serena|build|verify|max|close|[0-7])$ ]] \
+    || { echo "OC_STOP_AFTER_STEP invalide" >&2; exit 90; }
+  export FULLRUN_STOP_AFTER_STEP="$OC_STOP_AFTER_STEP"
+fi
+if [ -n "${OC_TARGET_AGENT:-}" ]; then
+  [[ "$OC_TARGET_AGENT" =~ ^[A-Za-z][A-Za-z0-9_-]{0,39}$ ]] \
+    || { echo "OC_TARGET_AGENT invalide" >&2; exit 90; }
+  export FULLRUN_TARGET_AGENT="$OC_TARGET_AGENT"
 fi
 [[ "$POLL" =~ ^[0-9]{1,3}$ && "$POLL" -ge 1 ]] || POLL=30
 [[ "$GRACE" =~ ^[0-9]{1,3}$ ]] || GRACE=60

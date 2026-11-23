@@ -430,6 +430,7 @@ run_guard() {
   env -i PATH="/usr/bin:/bin" GITHUB_OUTPUT="$T/gout" GITHUB_ENV="$T/genv" RUNNER_TEMP="$T" \
     IN_BRANCH=feat-x IN_JOB=job1 IN_PROMPT=prompts:p.md IN_LIFEOS_REF=main \
     OC_ISA_PATH="MEMORY/WORK/x/ISA.md" IN_IDLE_MIN=20 IN_AGENT_IDLE_MIN= IN_START_STEP= \
+    IN_STOP_AFTER_STEP= IN_TARGET_AGENT= \
     IN_DONE_AGENTS=Max IN_WIP_PUSH_MIN=30 IN_CHAIN_PHASE=build IN_PREV_RUN_ID= IN_NEXT= IN_HAS_STATE= \
     IN_PROMPT_BUILD=prompts:b.md IN_PROMPT_VERIFY=prompts:v.md IN_PROMPT_CLOSE=prompts:c.md \
     OC_MODEL_MAIN=opencode/m-free OC_MODEL_MAX=opencode/x-free OC_MODEL_FALLBACK=opencode/f-free \

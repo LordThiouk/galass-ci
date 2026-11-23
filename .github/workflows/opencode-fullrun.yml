@@ -52,11 +52,11 @@ on:
       model_fallback:
         description: "Repli (compat) quand model_chain est vide : un seul modèle de secours"
         type: string
-        default: opencode/glm-5.3-flash-free
+        default: opencode/mimo-v2.6-flash-free
       model_chain:
-        description: "Chaîne de secours ordonnée (gratuits opencode/*-free, séparés par des virgules ; le principal est retiré)"
+        description: "Chaîne de secours ordonnée (gratuits opencode/*-free, séparés par des virgules ; le principal est retiré) — 5 modèles vérifiés verts, modèles morts retirés (glm-5.3-flash-free, minimax-m3.1-flash-free, longcat-2.5-free, flint-40b-free, inkling-2-small-free)"
         type: string
-        default: opencode/glm-5.3-flash-free,opencode/minimax-m3.1-flash-free,opencode/mimo-v2.6-flash-free,opencode/longcat-2.5-free,opencode/iceman-free,opencode/flint-40b-free,opencode/nemotron-3.5-lightning-free,opencode/beam-free,opencode/inkling-2-small-free
+        default: opencode/mimo-v2.6-flash-free,opencode/iceman-free,opencode/nemotron-3.5-lightning-free,opencode/beam-free,opencode/hy4-flash-free
       lifeos_ref:
         description: "Branche de LordThiouk/lifeos (skills, agents, config opencode privée)"
         type: string
@@ -67,6 +67,14 @@ on:
         default: ""
       start_step:
         description: "Étape de départ demandée (build, verify, max, close ou 0-7) ; vide = comportement habituel. C'est une demande : LifeOS ne l'ouvre que si les étapes avant sont prouvées (report signé), sinon il redescend et le dit"
+        type: string
+        default: ""
+      stop_after_step:
+        description: "S'arrête après cette étape sans dispatcher la suite (scaffold, completeness_pre, vera, serena, build, verify, max, close ou 0-7) ; vide = enchaînement normal. Passé à FullRunPipeline.ts unit via --stop-after-step."
+        type: string
+        default: ""
+      target_agent:
+        description: "Limite ce job à un seul agent de l'étape visée (ex. Silas en verify) ; vide = tous les agents requis de l'étape. Passé à FullRunPipeline.ts unit via --agent."
         type: string
         default: ""
       base_branch:
@@ -175,6 +183,8 @@ jobs:
       IN_LIFEOS_REF: ${{ inputs.lifeos_ref }}
       OC_ISA_PATH: ${{ inputs.isa_path }}
       IN_START_STEP: ${{ inputs.start_step }}
+      IN_STOP_AFTER_STEP: ${{ inputs.stop_after_step }}
+      IN_TARGET_AGENT: ${{ inputs.target_agent }}
       IN_IDLE_MIN: ${{ inputs.idle_minutes }}
       IN_AGENT_IDLE_MIN: ${{ inputs.agent_idle_minutes }}
       IN_DONE_AGENTS: ${{ inputs.done_agents }}
@@ -242,6 +252,21 @@ jobs:
             [[ "$start" =~ ^(scaffold|completeness_pre|vera|serena|build|verify|max|close|[0-7])$ ]] \
               || fail "start_step invalide (scaffold, completeness_pre, vera, serena, build, verify, max, close ou 0-7 ; jamais deploy)"
             echo "OC_START_STEP=$start" >> "$GITHUB_ENV"
+          fi
+          # stop_after_step (facultatif) : même liste que start_step, jamais deploy. Transmis à LifeOS
+          # par le wrapper (FULLRUN_STOP_AFTER_STEP). Vide = enchaînement normal, rien n'est transmis.
+          if [ -n "$IN_STOP_AFTER_STEP" ]; then
+            stop_step="${IN_STOP_AFTER_STEP,,}"
+            [[ "$stop_step" =~ ^(scaffold|completeness_pre|vera|serena|build|verify|max|close|[0-7])$ ]] \
+              || fail "stop_after_step invalide (scaffold, completeness_pre, vera, serena, build, verify, max, close ou 0-7 ; jamais deploy)"
+            echo "OC_STOP_AFTER_STEP=$stop_step" >> "$GITHUB_ENV"
+          fi
+          # target_agent (facultatif) : nom d'agent (ex. Silas) limitant ce job à un seul agent de
+          # l'étape visée. Transmis à LifeOS par le wrapper (FULLRUN_TARGET_AGENT). Jamais injecté tel
+          # quel dans une commande : charset restreint, lettre initiale, 40 caractères max.
+          if [ -n "$IN_TARGET_AGENT" ]; then
+            [[ "$IN_TARGET_AGENT" =~ ^[A-Za-z][A-Za-z0-9_-]{0,39}$ ]] || fail "target_agent invalide (nom d'agent, ex. Silas)"
+            echo "OC_TARGET_AGENT=$IN_TARGET_AGENT" >> "$GITHUB_ENV"
           fi
           [[ "$IN_DONE_AGENTS" =~ ^[A-Za-z][A-Za-z0-9_-]{0,39}(,[A-Za-z][A-Za-z0-9_-]{0,39}){0,5}$ ]] \
             || fail "done_agents invalide (noms séparés par des virgules, ex. Max,Silas)"
@@ -669,6 +694,59 @@ jobs:
             esac
           fi
           echo "Prompt prêt ($(wc -l < "$OC_WORK/prompt.md") lignes), base $(git rev-parse --short HEAD)"
+
+      # Préflight du lien (lecture seule) : AVANT opencode, dire où la porte démarrera et si l'agent imposé par le
+      # chaînage y sera accepté. start_step est une DEMANDE : sans verdict build signé dans le carry, la porte
+      # redescend au build et rejette un agent de verify. Rien n'est ouvert, rien n'est écrit (ni GITHUB_ENV, ni
+      # ISA, ni carry) et aucun secret n'entre ici.
+      # Codes du CLI lifeos (table unique, README) : 0 cohérent ; 2 porte ≠ start_step ; 3 agent imposé refusé ;
+      # 4 claims ouvertes hors périmètre gelé ; 5 chain_phase incohérent ; 64 entrée invalide ; 70 crash du CLI.
+      # 2, 3, 4, 5 et 64 arrêtent le job avant opencode. 70 (crash) et CLI absent sont signalés par une annotation
+      # d'ERREUR et un bandeau dans le résumé : le contrôle n'a pas eu lieu, jamais en silence ; la porte juge seule.
+      # Logs publics : le CLI n'écrit que des compteurs et des codes, aucun identifiant de claim ; le JSON (compteurs)
+      # reste dans $RUNNER_TEMP.
+      - name: Préflight du lien (porte de départ, périmètre gelé, agent imposé)
+        id: preflight
+        # Couvre aussi un job borné à une étape (stop_after_step/target_agent, sans start_step) :
+        # ~30 s pour détecter un blocage de porte ou d'agent avant les dizaines de minutes d'un run opencode.
+        if: (env.OC_START_STEP != '' || env.OC_STOP_AFTER_STEP != '') && env.OC_ISA_PATH != ''
+        shell: bash
+        run: |
+          pf="$HOME/.claude/LIFEOS/TOOLS/FullRunPreflight.ts"
+          if [ ! -f "$pf" ]; then
+            echo "::error::PRÉFLIGHT NON ÉVALUÉ : lifeos_ref sans FullRunPreflight.ts, la porte de départ n'est pas prédite"
+            { echo "### Préflight du lien"; echo "**NON ÉVALUÉ** : lifeos_ref sans FullRunPreflight.ts."; } >> "$GITHUB_STEP_SUMMARY" || true
+            exit 0
+          fi
+          # Étape prédite : start_step si fourni, sinon stop_after_step (un job borné à UNE étape
+          # vise d'abord à l'ouvrir, avant d'y rester).
+          eff_step="${OC_START_STEP:-$OC_STOP_AFTER_STEP}"
+          args=(--isa "$TARGET_DIR/$OC_ISA_PATH" --start-step "$eff_step")
+          if [ "${IN_CHAIN_ENABLED:-}" = true ]; then
+            args+=(--chain-phase "$IN_CHAIN_PHASE")
+            [ -z "${IN_NEXT:-}" ] || args+=(--next "$IN_NEXT")
+          elif [ -n "${OC_TARGET_AGENT:-}" ]; then
+            # target_agent sans chaînage : même rôle que --next en phase verify (agent imposé au
+            # lien), pour que le code 3 (agent imposé refusé) puisse se déclencher ici.
+            args+=(--next "$OC_TARGET_AGENT")
+          fi
+          rc=0
+          OC_DONE_AGENTS="${IN_DONE_AGENTS:-}" bun "$pf" "${args[@]}" >"$RUNNER_TEMP/preflight.json" 2>"$RUNNER_TEMP/preflight.err" || rc=$?
+          # stderr : compteurs, codes et paramètres de relance seulement (pas d'identifiant de claim, pas de chemin).
+          { echo "### Préflight du lien (code $rc)"; echo '```'; cat "$RUNNER_TEMP/preflight.err"; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+          cat "$RUNNER_TEMP/preflight.err"
+          case "$rc" in
+            0) ;;
+            2|3|4|5)
+               echo "::error::préflight code $rc : la porte ne démarrera pas comme ce lien le suppose (voir README, table des codes) ; corriger et relancer, aucune minute opencode dépensée"
+               exit 1 ;;
+            64)
+               echo "::error::préflight code 64 : entrée invalide (ISA, start_step ou chain_phase) ; corriger les paramètres du lancement"
+               exit 1 ;;
+            *)
+               echo "::error::PRÉFLIGHT EN PANNE (code $rc) : le contrôle n'a PAS eu lieu, la porte jugera seule ; ouvrir un ticket lifeos"
+               { echo ""; echo "**PRÉFLIGHT EN PANNE (code $rc) : contrôle non effectué.**"; } >> "$GITHUB_STEP_SUMMARY" || true ;;
+          esac
 
       # Avant opencode : gitleaks (épinglé, sha256 vérifié), les scripts de masquage, de chiffrement,
       # du journal en direct, des dépôts supplémentaires, et le destinataire age sont copiés en root
