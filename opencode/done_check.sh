@@ -312,6 +312,31 @@ fi
 # --- d. arbre propre, rapport, ISA non close ---
 dirty=$(cd "$REPO" && git status --porcelain 2>/dev/null | grep -vE '^.. \.fullrun/logs/' || true)
 [ -z "$dirty" ] || ko d:arbre-sale
+if [ -n "$REPORT" ] && { [ ! -f "$REPORT" ] || [ ! -s "$REPORT" ]; }; then
+  # Repli factuel : a (verdict agent) et b (hooks.log) ont déjà PASS plus haut — le travail et le
+  # verdict existent — mais le modèle n'a pas écrit REPORT.md. Génère un rapport minimal à partir
+  # des SEULS faits déjà vérifiés par ce script (jamais un contenu inventé), au lieu d'échouer en
+  # faux négatif sur d:rapport-absent.
+  head_sha=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo "?")
+  isa_phase="(isa non fournie)"
+  if [ -n "$ISA" ]; then
+    isa_abs="$ISA"; case "$isa_abs" in /*) ;; *) isa_abs="$REPO/$isa_abs" ;; esac
+    [ -f "$isa_abs" ] && isa_phase=$(grep -m1 -E '^phase:' "$isa_abs" || echo "(champ phase absent)")
+  fi
+  mkdir -p "$(dirname "$REPORT")" 2>/dev/null || true
+  {
+    echo "# REPORT (repli automatique)"
+    echo
+    echo "Ce rapport n'a PAS été écrit par le modèle : généré par \`done_check.sh\` à partir des"
+    echo "seuls faits déjà vérifiés par ce script (aucun contenu inventé)."
+    echo
+    echo "- Verdict agent(s) requis (\`$AGENTS\`) : PASS (stockage opencode, vérifié a+b plus haut)"
+    echo "- Commit HEAD au moment du contrôle : \`$head_sha\`"
+    echo "- ISA : \`${ISA:-"(non fournie)"}\` — $isa_phase"
+    echo "- Généré : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$REPORT"
+  echo "done_check: REPORT.md absent — repli factuel généré ($REPORT)" >&2
+fi
 [ -n "$REPORT" ] && [ -s "$REPORT" ] || ko d:rapport-absent
 if [ -n "$ISA" ]; then
   isa="$ISA"

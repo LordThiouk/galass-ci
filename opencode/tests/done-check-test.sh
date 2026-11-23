@@ -128,6 +128,42 @@ else
   ok 9d "workflow sans env.HOME"
 fi
 
+# 9e. REPORT.md absent (a et b PASS) -> repli factuel généré, done_check=ok.
+rm -f "$T/REPORT_fallback.md"
+out=$(call "$T/s6" OC_REPORT="$T/REPORT_fallback.md")
+[ "$out" = "done_check=ok" ] && ok 9e "REPORT.md absent : repli généré, done_check=ok" || ko "9e [$out]"
+
+# 9f. le fichier de repli a bien été écrit, avec le marqueur « repli automatique ».
+if [ -s "$T/REPORT_fallback.md" ] && grep -q 'repli automatique' "$T/REPORT_fallback.md"; then
+  ok 9f "repli : REPORT.md écrit avec le marqueur de repli"
+else
+  ko "9f repli : fichier absent ou marqueur manquant"
+fi
+
+# 9g. le repli ne divulgue jamais le chemin absolu du dépôt (REPO).
+if grep -qF "$R" "$T/REPORT_fallback.md" 2>/dev/null; then
+  ko "9g repli : chemin absolu du dépôt présent dans le rapport"
+else
+  ok 9g "repli : aucune fuite du chemin absolu du dépôt"
+fi
+rm -f "$T/REPORT_fallback.md"
+
+# 9h. REPORT.md présent mais VIDE (0 octet) déclenche le même repli (test -s, pas seulement -f).
+: >"$T/REPORT_fallback.md"
+out=$(call "$T/s6" OC_REPORT="$T/REPORT_fallback.md")
+[ "$out" = "done_check=ok" ] && [ -s "$T/REPORT_fallback.md" ] && grep -q 'repli automatique' "$T/REPORT_fallback.md" \
+  && ok 9h "REPORT.md vide (0 octet) : même repli que l'absence" || ko "9h [$out]"
+rm -f "$T/REPORT_fallback.md"
+
+# 9i. le repli ne masque JAMAIS un échec réel : sans hooks.log confirmant l'agent (b:hooks), aucun
+# rapport de repli n'est écrit, même si REPORT.md est absent.
+printf 'autre chose\n' >"$HOOKS"
+out=$(call "$T/s6" OC_REPORT="$T/REPORT_fallback.md")
+[ "$out" = "done_check=ko raison=b:hooks" ] && [ ! -e "$T/REPORT_fallback.md" ] \
+  && ok 9i "repli : b:hooks toujours refusé, aucun rapport de repli écrit" || ko "9i [$out]"
+mklog Max
+rm -f "$T/REPORT_fallback.md"
+
 # 10. boucle : PASS vérifié + session inactive -> run-fullrun sort 0 avec arret=max_pass.
 mkdir -p "$T/run"
 cat >"$T/fake-oc" <<'EOF'
