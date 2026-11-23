@@ -1,0 +1,376 @@
+name: opencode Task (hors FullRun)
+run-name: Task ${{ inputs.job_name }} → ${{ inputs.target_repo }}@${{ inputs.branch }}
+
+# Tâches ciblées opencode HORS FullRun pour un dépôt Galass choisi par target_repo
+# (liste blanche unique : opencode/allowed-repos.sh, la même que opencode-fullrun.yml).
+# Dépôt PUBLIC : la sortie d'opencode reste sur le runner (jamais affichée ni publiée).
+# Aucun plugin/porte FullRun : opencode travaille directement, committe localement,
+# puis le workflow vérifie gitleaks et pousse en avance rapide sur la branche dédiée.
+# Pas d'installation spécifique au dépôt cible (aucun uv, aucun flutter build/run) :
+# les dépôts Flutter ne reçoivent que la toolchain d'opencode.
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Dépôt Galass cible (Driver, Rider, backend ou tests e2e)"
+        required: true
+        type: choice
+        options:
+          - Galass_Driver
+          - Galass_Rider
+          - Galass_backend
+          - galass-emu-actions-pub
+      branch:
+        description: "Branche de fonctionnalité du dépôt cible, déjà poussée (jamais main/master)"
+        required: true
+        type: string
+      prompt_path:
+        description: "Prompt : prompts:<chemin sur la branche fullrun-prompts du dépôt cible> ou target:<chemin sur la branche>"
+        required: true
+        type: string
+      job_name:
+        description: "Nom court du job (lettres, chiffres, - _ .)"
+        required: true
+        type: string
+      model_main:
+        description: "Modèle principal (gratuit opencode/*-free uniquement)"
+        type: string
+        default: opencode/deepseek-v4.1-flash-free
+      model_chain:
+        description: "Chaîne de secours (opencode/*-free séparés par des virgules)"
+        type: string
+        default: opencode/mimo-v2.6-flash-free,opencode/iceman-free,opencode/nemotron-3.5-lightning-free,opencode/beam-free,opencode/hy4-flash-free
+      timeout_minutes:
+        description: "Durée max d'exécution opencode en minutes (10 à 90)"
+        type: string
+        default: "45"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencode-task-${{ inputs.target_repo }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+env:
+  OPENCODE_VERSION: "1.19.4"
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  task:
+    if: github.actor == 'LordThiouk' && github.triggering_actor == 'LordThiouk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    env:
+      IN_BRANCH: ${{ inputs.branch }}
+      IN_PROMPT: ${{ inputs.prompt_path }}
+      IN_JOB: ${{ inputs.job_name }}
+      OC_MODEL_MAIN: ${{ inputs.model_main }}
+      OC_MODEL_CHAIN: ${{ inputs.model_chain }}
+      IN_TIMEOUT_MIN: ${{ inputs.timeout_minutes }}
+      TARGET_REPO: ${{ inputs.target_repo }}
+      TARGET_DIR: ${{ github.workspace }}/target
+      TARGET_GIT: https://github.com/LordThiouk/${{ inputs.target_repo }}.git
+      CI_DIR: ${{ github.workspace }}/ci
+      OC_WORK: ${{ runner.temp }}/oc
+
+    steps:
+      - name: Validation des entrées
+        id: guard
+        run: |
+          set +x
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$IN_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || fail "branche invalide"
+          case "${IN_BRANCH,,}" in
+            main|master|head|refs/*|*..*|*/|*.lock|fullrun-logs/*|fullrun-prompts|fullrun-prompts/*) fail "branche interdite : seule une branche de fonctionnalité est acceptée" ;;
+          esac
+          [[ "$IN_JOB" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail "job_name invalide"
+          [[ "$IN_PROMPT" =~ ^(prompts|target):[A-Za-z0-9._/-]+$ && "$IN_PROMPT" != *..* ]] || fail "prompt_path invalide (prompts:<chemin> ou target:<chemin>)"
+          [[ "${IN_PROMPT#*:}" != /* ]] || fail "prompt_path doit être relatif au dépôt cible"
+          # target_repo : la liste blanche unique est vérifiée après le checkout de galass-ci
+          # (opencode/allowed-repos.sh), jamais recopiée ici.
+          [[ "$OC_MODEL_MAIN" =~ ^opencode/[a-z0-9.-]+-free$ ]] || fail "seuls les modèles opencode/*-free sont admis"
+          [ -n "$OC_MODEL_CHAIN" ] || fail "chaîne de secours vide"
+          IFS=',' read -ra ms <<< "$OC_MODEL_CHAIN"
+          n=0
+          for m in "${ms[@]}"; do
+            m="${m// /}"
+            [ -z "$m" ] && continue
+            [[ "$m" =~ ^opencode/[a-z0-9.-]+-free$ ]] || fail "modèle de secours refusé : $m"
+            [ "$m" != "$OC_MODEL_MAIN" ] || fail "le secours doit différer du principal ($m)"
+            n=$((n + 1))
+          done
+          [ "$n" -ge 1 ] || fail "chaîne de secours vide"
+          [[ "$IN_TIMEOUT_MIN" =~ ^[0-9]+$ ]] && [ "$IN_TIMEOUT_MIN" -ge 10 ] && [ "$IN_TIMEOUT_MIN" -le 90 ] || fail "timeout_minutes doit être entre 10 et 90"
+          echo "t0=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Garde du secret GALASS_TOKEN
+        env:
+          GALASS_TOKEN: ${{ secrets.GALASS_TOKEN }}
+        run: |
+          set +x
+          [ -n "${GALASS_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
+
+      - name: Checkout galass-ci
+        uses: actions/checkout@v4
+        with:
+          path: ci
+          persist-credentials: false
+
+      - name: Valider target_repo (liste blanche unique)
+        run: |
+          set +x
+          fail() { echo "::error::$1"; exit 1; }
+          [ -f "$CI_DIR/opencode/allowed-repos.sh" ] || fail "allowed-repos.sh absent : impossible de valider target_repo"
+          # shellcheck source=opencode/allowed-repos.sh
+          . "$CI_DIR/opencode/allowed-repos.sh"
+          allowed_repo "$TARGET_REPO" || fail "target_repo hors liste autorisée : $TARGET_REPO"
+          [ "$TARGET_GIT" = "https://github.com/LordThiouk/${TARGET_REPO}.git" ] || fail "TARGET_GIT incohérent"
+          echo "Cible : $TARGET_REPO@$IN_BRANCH"
+
+      - name: Checkout du dépôt cible (lecture seule)
+        uses: actions/checkout@v4
+        with:
+          repository: LordThiouk/${{ inputs.target_repo }}
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.GALASS_TOKEN }}
+          path: target
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Préparer le prompt et le SHA de départ
+        id: prep
+        run: |
+          set +x
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$(git -C "$TARGET_DIR" rev-parse --abbrev-ref HEAD)" = "$IN_BRANCH" ] || fail "branche cible inattendue"
+          git -C "$TARGET_DIR" config user.name "Nix"
+          git -C "$TARGET_DIR" config user.email "nix@galass.local"
+          # Aucun push utilisable par l'IA : le push final du workflow contourne ce hook.
+          printf '#!/bin/sh\necho "push interdit pendant le run opencode" >&2\nexit 1\n' > "$TARGET_DIR/.git/hooks/pre-push"
+          chmod +x "$TARGET_DIR/.git/hooks/pre-push"
+          mkdir -p "$OC_WORK"
+          echo "base=$(git -C "$TARGET_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          scheme="${IN_PROMPT%%:*}"
+          rel="${IN_PROMPT#*:}"
+          raw="$OC_WORK/raw_prompt.md"
+          if [ "$scheme" = "prompts" ]; then
+            # Prompts hors branche de travail : branche fullrun-prompts du dépôt cible, jamais fusionnée.
+            git -C "$TARGET_DIR" cat-file -e "origin/fullrun-prompts:$rel" 2>/dev/null \
+              || fail "prompt introuvable sur origin/fullrun-prompts : $rel"
+            git -C "$TARGET_DIR" show "origin/fullrun-prompts:$rel" > "$raw"
+          else
+            p=$(realpath -e "$TARGET_DIR/$rel" 2>/dev/null) || fail "prompt introuvable : $rel"
+            case "$p" in
+              "$TARGET_DIR"/*) ;;
+              *) fail "prompt hors du dépôt cible" ;;
+            esac
+            cp "$p" "$raw"
+          fi
+          # L'IA n'a pas à lire les prompts des autres jobs : on retire la référence locale.
+          git -C "$TARGET_DIR" update-ref -d refs/remotes/origin/fullrun-prompts 2>/dev/null || true
+
+          {
+            echo "# Tâche opencode (mode direct, hors FullRun)"
+            echo "- Tu travailles dans le répertoire courant (dépôt \`LordThiouk/${TARGET_REPO}\`, branche de fonctionnalité déjà active)."
+            echo "- Jamais de push, jamais de \`git merge\`, jamais de force-push, jamais de secret ni de fausse clé en dur."
+            echo "- Committe tout travail validé sur la branche courante : le workflow vérifie \`gitleaks\` et pousse pour toi après ta fin."
+            echo "- Exclue \`node_modules\`, \`.git\`, \`dist\`, \`build\`, \`.venv\` de tes recherches."
+            echo "- Dépôt Flutter : n'installe rien de lourd et ne lance jamais \`flutter build\`, \`flutter run\` ni gradle (interdits ici)."
+            echo "- Arrête-toi après deux passes vides plutôt que de boucler."
+            echo "- Avant de terminer, écris un court résumé factuel (SHA, tests, résultats) dans \`/tmp/task_done.md\`."
+            echo
+            echo "---"
+            echo
+          } > "$OC_WORK/prompt.md"
+          cat "$raw" >> "$OC_WORK/prompt.md"
+          echo "Prompt prêt ($(wc -l < "$OC_WORK/prompt.md") lignes), base $(git -C "$TARGET_DIR" rev-parse --short HEAD)"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Installer opencode et gitleaks (épinglés, sha256 vérifié)
+        run: |
+          set +x
+          npm install -g --no-fund --no-audit "opencode-ai@${OPENCODE_VERSION}" >/dev/null 2>&1
+          v=$(opencode --version 2>/dev/null | tail -n1)
+          [ "$v" = "$OPENCODE_VERSION" ] || { echo "::error::opencode $v au lieu de $OPENCODE_VERSION"; exit 1; }
+          echo "opencode $v"
+
+          f="$RUNNER_TEMP/gitleaks.tgz"
+          curl -sSfL -o "$f" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${f}" | sha256sum -c --quiet
+          mkdir -p "$RUNNER_TEMP/gl" && tar -xzf "$f" -C "$RUNNER_TEMP/gl" gitleaks
+          sudo install -o root -g root -m 0755 "$RUNNER_TEMP/gl/gitleaks" /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Configurer opencode (sans FullRun ni secrets)
+        run: |
+          set +x
+          cat <<'CFG' > "$OC_WORK/opencode.json"
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "autoupdate": false,
+            "share": "disabled",
+            "mcp": {},
+            "permission": {
+              "doom_loop": "deny",
+              "read": { "*": "allow" },
+              "edit": { "*": "allow" },
+              "external_directory": { "*": "allow", "{env:HOME}/.ssh/*": "deny" },
+              "bash": {
+                "*": "allow",
+                "git push*": "deny",
+                "git merge*": "deny",
+                "gh *": "deny",
+                "ssh *": "deny",
+                "scp *": "deny",
+                "*git remote*": "deny",
+                "*http.extraheader*": "deny",
+                "*gradlew*": "deny",
+                "*gradle *": "deny",
+                "flutter build*": "deny",
+                "*flutter build*": "deny",
+                "flutter run*": "deny",
+                "*flutter run*": "deny"
+              }
+            }
+          }
+          CFG
+
+      - name: Exécuter la tâche opencode
+        id: oc
+        env:
+          BASE_SHA: ${{ steps.prep.outputs.base }}
+        run: |
+          set +x
+          export OPENCODE_CONFIG="$OC_WORK/opencode.json"
+          unset LIFEOS_FULLRUN
+
+          models=("$OC_MODEL_MAIN")
+          IFS=',' read -ra extras <<< "$OC_MODEL_CHAIN"
+          for m in "${extras[@]}"; do
+            m="${m// /}"
+            [ -z "$m" ] && continue
+            [ "$m" = "$OC_MODEL_MAIN" ] && continue
+            models+=("$m")
+          done
+
+          secs=$(( 10#$IN_TIMEOUT_MIN * 60 ))
+          status="erreur"
+          used_model=""
+          for m in "${models[@]}"; do
+            used_model="$m"
+            log="$OC_WORK/run-${m##*/}.log"
+            set +e
+            (cd "$TARGET_DIR" && timeout "$secs" opencode run --model "$m" "Lis $OC_WORK/prompt.md et exécute-le complètement.") > "$log" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -eq 124 ]; then
+              status="timeout"
+              break
+            fi
+            if grep -qiE "Free usage limit reached|AI_APICallError" "$log"; then
+              status="limit"
+              continue
+            fi
+            new_commits=$(git -C "$TARGET_DIR" rev-list --count "${BASE_SHA}..HEAD")
+            if [ "$rc" -eq 0 ] && { [ "$new_commits" -gt 0 ] || [ -f /tmp/task_done.md ]; }; then
+              status="ok"
+              break
+            fi
+            if [ ! -s "$log" ]; then
+              status="vide"
+              continue
+            fi
+            status="erreur"
+          done
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "model=$used_model" >> "$GITHUB_OUTPUT"
+          echo "Tâche opencode terminée : status=$status model=$used_model"
+
+      - name: Contrôle gitleaks et push en avance rapide
+        id: push
+        if: always() && steps.prep.outputs.base != ''
+        env:
+          GALASS_TOKEN: ${{ secrets.GALASS_TOKEN }}
+          BASE_SHA: ${{ steps.prep.outputs.base }}
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+        run: |
+          set +x
+          [ -n "${GALASS_TOKEN:-}" ] || { echo "::error::secret GALASS_TOKEN absent (acte Papa requis)"; exit 1; }
+          [ "$(git -C "$TARGET_DIR" rev-parse --abbrev-ref HEAD)" = "$IN_BRANCH" ] || { echo "::error::opencode a changé de branche : push refusé"; exit 1; }
+          HEAD_SHA=$(git -C "$TARGET_DIR" rev-parse HEAD)
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          COUNT=$(git -C "$TARGET_DIR" rev-list --count "${BASE_SHA}..${HEAD_SHA}")
+          echo "commits=$COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "Aucun nouveau commit à pousser."
+            exit 0
+          fi
+
+          # Avance rapide seulement : l'historique de départ doit rester un ancêtre.
+          git -C "$TARGET_DIR" merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA" \
+            || { echo "::error::historique réécrit depuis le SHA de départ : push refusé"; exit 1; }
+          # Une modification de workflow poussée sur une branche pourrait s'exécuter avec les
+          # secrets du dépôt cible : refusée, comme en FullRun.
+          if [ -n "$(git -C "$TARGET_DIR" diff --name-only "${BASE_SHA}..${HEAD_SHA}" -- .github/workflows)" ]; then
+            echo "::error::modification de .github/workflows : push refusé"
+            exit 1
+          fi
+
+          # --redact : jamais un secret trouvé recopié dans les logs publics.
+          gitleaks detect --source "$TARGET_DIR" --log-opts="${BASE_SHA}..${HEAD_SHA}" --no-banner --redact
+
+          ASKPASS="$RUNNER_TEMP/askpass.sh"
+          printf '#!/bin/sh\necho "$GALASS_TOKEN"\n' > "$ASKPASS"
+          chmod 700 "$ASKPASS"
+          GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$ASKPASS" \
+            git -c core.hooksPath=/dev/null -c push.followTags=false -C "$TARGET_DIR" push --no-verify --porcelain \
+            "$TARGET_GIT" "HEAD:refs/heads/${IN_BRANCH}"
+          rm -f "$ASKPASS"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "Poussé ${HEAD_SHA:0:7} ($COUNT commit(s)) sur ${IN_BRANCH}."
+
+      - name: Notification de fin (opencode-notify)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          OC_NOTIFY_URL: ${{ secrets.OC_NOTIFY_URL }}
+          OC_NOTIFY_KEY: ${{ secrets.OC_NOTIFY_KEY }}
+          OC_STATUS: ${{ steps.oc.outputs.status }}
+          OC_MODEL: ${{ steps.oc.outputs.model }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          HEAD_SHA: ${{ steps.push.outputs.head }}
+          COMMITS: ${{ steps.push.outputs.commits }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +x
+          if [ -z "${OC_NOTIFY_URL:-}" ] || [ -z "${OC_NOTIFY_KEY:-}" ]; then exit 0; fi
+          message="Task CI ${IN_JOB:-} (${TARGET_REPO:-}@${IN_BRANCH:-}) : status=${OC_STATUS:-?} model=${OC_MODEL:-?} pushed=${PUSHED:-false} commits=${COMMITS:-0} sha=${HEAD_SHA:0:7} — ${RUN_URL:-}"
+          payload=$(jq -cn --arg job "${IN_JOB:-}" --arg status "${OC_STATUS:-}" --arg message "$message" \
+            '{job: $job, status: $status, message: $message}')
+          curl -sS --max-time 15 -X POST "$OC_NOTIFY_URL" \
+            -H "Authorization: Bearer $OC_NOTIFY_KEY" \
+            -H "X-Automation-Key: $OC_NOTIFY_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$payload" >/dev/null || true
+
+      - name: Statut final
+        if: always()
+        run: |
+          if [ "${{ steps.oc.outputs.status }}" != "ok" ]; then
+            echo "::error::Tâche opencode non terminée : ${{ steps.oc.outputs.status }}"
+            exit 1
+          fi
