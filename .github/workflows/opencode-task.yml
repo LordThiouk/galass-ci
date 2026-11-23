@@ -77,7 +77,6 @@ jobs:
       TARGET_DIR: ${{ github.workspace }}/target
       TARGET_GIT: https://github.com/LordThiouk/${{ inputs.target_repo }}.git
       CI_DIR: ${{ github.workspace }}/ci
-      OC_WORK: ${{ runner.temp }}/oc
 
     steps:
       - name: Validation des entrées
@@ -154,12 +153,12 @@ jobs:
           # Aucun push utilisable par l'IA : le push final du workflow contourne ce hook.
           printf '#!/bin/sh\necho "push interdit pendant le run opencode" >&2\nexit 1\n' > "$TARGET_DIR/.git/hooks/pre-push"
           chmod +x "$TARGET_DIR/.git/hooks/pre-push"
-          mkdir -p "$OC_WORK"
+          mkdir -p "$RUNNER_TEMP/oc"
           echo "base=$(git -C "$TARGET_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
           scheme="${IN_PROMPT%%:*}"
           rel="${IN_PROMPT#*:}"
-          raw="$OC_WORK/raw_prompt.md"
+          raw="$RUNNER_TEMP/oc/raw_prompt.md"
           if [ "$scheme" = "prompts" ]; then
             # Prompts hors branche de travail : branche fullrun-prompts du dépôt cible, jamais fusionnée.
             git -C "$TARGET_DIR" cat-file -e "origin/fullrun-prompts:$rel" 2>/dev/null \
@@ -188,9 +187,9 @@ jobs:
             echo
             echo "---"
             echo
-          } > "$OC_WORK/prompt.md"
-          cat "$raw" >> "$OC_WORK/prompt.md"
-          echo "Prompt prêt ($(wc -l < "$OC_WORK/prompt.md") lignes), base $(git -C "$TARGET_DIR" rev-parse --short HEAD)"
+          } > "$RUNNER_TEMP/oc/prompt.md"
+          cat "$raw" >> "$RUNNER_TEMP/oc/prompt.md"
+          echo "Prompt prêt ($(wc -l < "$RUNNER_TEMP/oc/prompt.md") lignes), base $(git -C "$TARGET_DIR" rev-parse --short HEAD)"
 
       - uses: actions/setup-node@v4
         with:
@@ -214,7 +213,7 @@ jobs:
       - name: Configurer opencode (sans FullRun ni secrets)
         run: |
           set +x
-          cat <<'CFG' > "$OC_WORK/opencode.json"
+          cat <<'CFG' > "$RUNNER_TEMP/oc/opencode.json"
           {
             "$schema": "https://opencode.ai/config.json",
             "autoupdate": false,
@@ -251,7 +250,7 @@ jobs:
           BASE_SHA: ${{ steps.prep.outputs.base }}
         run: |
           set +x
-          export OPENCODE_CONFIG="$OC_WORK/opencode.json"
+          export OPENCODE_CONFIG="$RUNNER_TEMP/oc/opencode.json"
           unset LIFEOS_FULLRUN
 
           models=("$OC_MODEL_MAIN")
@@ -268,9 +267,9 @@ jobs:
           used_model=""
           for m in "${models[@]}"; do
             used_model="$m"
-            log="$OC_WORK/run-${m##*/}.log"
+            log="$RUNNER_TEMP/oc/run-${m##*/}.log"
             set +e
-            (cd "$TARGET_DIR" && timeout "$secs" opencode run --model "$m" "Lis $OC_WORK/prompt.md et exécute-le complètement.") > "$log" 2>&1
+            (cd "$TARGET_DIR" && timeout "$secs" opencode run --model "$m" "Lis $RUNNER_TEMP/oc/prompt.md et exécute-le complètement.") > "$log" 2>&1
             rc=$?
             set -e
             if [ "$rc" -eq 124 ]; then
