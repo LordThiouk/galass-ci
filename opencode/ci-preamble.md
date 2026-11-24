@@ -30,6 +30,14 @@ Tu tournes sur un runner GitHub Actions public, pas sur la box. Suis le FullRun.
   `bash /opt/fullrun-tools/checkpoint.sh verdict --job $OC_JOB --agent Max`. Ce second appel est
   refusé si le verdict ne vient pas d'une vraie réponse du sous-agent : un PASS écrit par toi n'est
   jamais un verdict.
+- **Preuve signée (carry), pas seulement le checkpoint.** Le point de reprise ci-dessus est un
+  indice pour toi ; la porte FullRun ne lit que `MEMORY/WORK/<slug>/fullrun-carry.json`. Après un
+  PASS vérifié d'une étape (Vera, Serena, build, verify…), exporte le carry signé :
+  `bun ~/.claude/LIFEOS/TOOLS/FullRunPipeline.ts step --direction advance` (ou
+  `advance --isa <ISA> --step N --result pass`). Sans cette écriture, l'étape suivante sera refusée
+  (« pas de verdict signé »). Pour serena : charge le skill ISA (`skill(name="ISA")`), écris le
+  plan / dispatch map dans `## Decisions` APRÈS le dispatch `Architect`, puis avance. Un
+  `checkpoint.sh write` ou un PASS dans le rapport ne remplace jamais le carry signé.
 - **Sauvegarde automatique.** Un démon (hors opencode) commite localement, avant chaque push de wip :
   le report ISA et le point de reprise (`wip(carry)`), puis l'arbre de code filtré (`wip(autosave)`).
   Ces commits sont normaux : ne les défais pas, ne les prends pas pour une clôture. `.env`, clés et keystores,

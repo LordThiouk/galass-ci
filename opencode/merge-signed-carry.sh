@@ -165,6 +165,16 @@ def step_ids(parsed):
         return set()
     return {k for k, v in parsed["payload"]["steps"].items() if valid_step(v)}
 
+def rec_at(rec):
+    """Horodatage ISO d'un enregistrement ("" si absent) : compare deux versions du même id."""
+    a = rec.get("at")
+    return a if isinstance(a, str) else ""
+
+def newest_at(parsed):
+    """Horodatage le plus récent du fichier : dit quelle version est le dernier état connu."""
+    vals = [rec_at(rec) for rec in parsed["payload"]["steps"].values() if valid_step(rec)]
+    return max(vals) if vals else ""
+
 changed = 0
 for path in list_paths():
     if ".." in path or path.startswith("/"):
@@ -183,15 +193,21 @@ for path in list_paths():
             changed += 1
         continue
     current_ids = step_ids(current)
-    # Plus récente version historique qui possède au moins un step valide absent du courant.
+    current_newest = newest_at(current)
+    # Version historique à reprendre : soit elle possède un step valide absent du courant,
+    # soit c'est un état PLUS RÉCENT du carry (même ids, empreintes/horodatages plus récents).
+    # Sans ce second cas, un carry complet mais périmé (ex. restauré depuis un vieux commit)
+    # masque un carry plus récent amputé : les ids sont présents, donc aucune fusion n'était
+    # déclenchée et la porte lisait des empreintes d'ISA périmées.
     donor = None
     missing = set()
     for raw, parsed, src in versions[1:]:
         ids = step_ids(parsed)
         lost = {i for i in ids if i not in current_ids}
-        if lost:
+        newer_state = newest_at(parsed) > current_newest
+        if lost or newer_state:
             donor = (raw, parsed, src)
-            missing = lost
+            missing = lost | {i for i in ids if i in current_ids}
             break
     if not donor:
         continue
@@ -226,12 +242,16 @@ for path in list_paths():
             "head": current["payload"].get("head") or donor_parsed["payload"].get("head") or "",
             "steps": {},
         }
-        # D'abord les steps du donneur (signés déjà sur la branche), puis ceux du courant
-        # (plus récents pour le même id, nouveaux ids ajoutés).
+        # Pour chaque id, garder l'enregistrement le plus récent (horodatage). Un id présent
+        # des deux côtés ne doit jamais revenir à une version plus ancienne : c'était le cas
+        # quand le courant (fichier périmé restauré) écrasait le donneur (état plus récent).
         for src_parsed in (donor_parsed, current):
             for sid, rec in src_parsed["payload"]["steps"].items():
-                if valid_step(rec):
-                    payload["steps"][str(sid)] = rec
+                if not valid_step(rec):
+                    continue
+                sid = str(sid)
+                if sid not in payload["steps"] or rec_at(rec) >= rec_at(payload["steps"][sid]):
+                    payload["steps"][sid] = rec
         compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         sig = hmac.new(key, compact.encode("utf-8"), hashlib.sha256).hexdigest()
         text = json.dumps({"payload": payload, "sig": sig}, ensure_ascii=False, indent=2) + "\n"
