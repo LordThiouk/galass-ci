@@ -169,6 +169,38 @@ write_carry "$R5/MEMORY/WORK/s/fullrun-carry.json" "$KEY"
 [ "$(steps_of "$R5/MEMORY/WORK/s/fullrun-carry.json")" = "1 2" ] || ko "pre-commit n'a pas empêché la troncature, got $(steps_of "$R5/MEMORY/WORK/s/fullrun-carry.json")"
 ok "pre-commit : commit amputé rattrapé, steps 1 et 2 conservés"
 
+# --- 7bis. Régression : carry périmé (mêmes ids) ne doit pas masquer un état plus récent
+# Cas réel du 2026-11-24 : un carry complet mais du 18/11 (étapes 1-4, empreintes périmées)
+# a été réécrit par-dessus un carry du 23/11 (étapes 1-2, empreintes à jour). Les ids étaient
+# présents des deux côtés, donc l'ancienne fusion ne voyait rien à restaurer et la porte lisait
+# l'empreinte périmée (redescente vera). Le fichier le plus récent doit gagner.
+old1='{"status":"pass","at":"2026-11-18T00:58:22Z","fp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","scope_fp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","sha":"b2e4cc82c440ae482fa95497e3624b8f0557eb65"}'
+old2='{"status":"pass","at":"2026-11-18T00:58:41Z","fp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","scope_fp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","sha":"b2e4cc82c440ae482fa95497e3624b8f0557eb65"}'
+old3='{"status":"pass","at":"2026-11-18T01:07:50Z","fp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","scope_fp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","sha":"9addb2097574b99b8af4268b27c20740710a8757"}'
+old4='{"status":"pass","at":"2026-11-18T04:01:20Z","fp":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","scope_fp":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","sha":"126bba09a5c1b2d5eae12eb7db567026a0e21a13"}'
+payload_old() {
+  python3 -c 'import json,sys; print(json.dumps({"v":1,"isa":"s","head":"b2e4cc82c440ae482fa95497e3624b8f0557eb65","steps":{"1":json.loads(sys.argv[1]),"2":json.loads(sys.argv[2]),"3":json.loads(sys.argv[3]),"4":json.loads(sys.argv[4])}}))' "$old1" "$old2" "$old3" "$old4"
+}
+R6="$tmp/r6"
+git_init "$R6"
+mkdir -p "$R6/MEMORY/WORK/s"
+CARRY_PAYLOAD=$(payload_old)
+write_carry "$R6/MEMORY/WORK/s/fullrun-carry.json" "$KEY"
+(cd "$R6" && git add MEMORY && git commit -qm "carry 1+2+3+4 (18/11, périmé)")
+CARRY_PAYLOAD=$(payload12)
+write_carry "$R6/MEMORY/WORK/s/fullrun-carry.json" "$KEY"
+(cd "$R6" && git add MEMORY && git commit -qm "carry 1+2 (23/11, à jour)")
+newer=$(sha256sum "$R6/MEMORY/WORK/s/fullrun-carry.json" | awk '{print $1}')
+CARRY_PAYLOAD=$(payload_old)
+write_carry "$R6/MEMORY/WORK/s/fullrun-carry.json" "$KEY"
+env -u ISA_STAMP_KEY -u OC_ISA_KEY_FILE HOME="$tmp/empty-home" \
+  "$MSC" "$R6" >"$tmp/out7b" || ko "régression périmée : script a échoué"
+[ "$(steps_of "$R6/MEMORY/WORK/s/fullrun-carry.json")" = "1 2" ] || ko "régression périmée : état récent 1 2 attendu, got $(steps_of "$R6/MEMORY/WORK/s/fullrun-carry.json")"
+got=$(sha256sum "$R6/MEMORY/WORK/s/fullrun-carry.json" | awk '{print $1}')
+[ "$got" = "$newer" ] || ko "régression périmée : le carry récent signé n'a pas été restauré à l'identique"
+grep -q "restauré\|fusionné" "$tmp/out7b" || ko "régression périmée : message de reprise absent"
+ok "régression périmée (mêmes ids) : état le plus récent restauré"
+
 # --- 8. Le workflow fige le script et l'appelle avant les commits de fin -----
 wf="$here/../.github/workflows/opencode-fullrun.yml"
 [ -f "$wf" ] || ko "opencode-fullrun.yml absent"
