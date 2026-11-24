@@ -187,6 +187,9 @@ checkout() {
     git -C "$dir" config user.email "nix@galass.local"
     printf '#!/bin/sh\necho "push interdit pendant le run opencode" >&2\nexit 1\n' > "$dir/.git/hooks/pre-push"
     chmod +x "$dir/.git/hooks/pre-push"
+    if [ -x "$here/merge-signed-carry.sh" ]; then
+      "$here/merge-signed-carry.sh" install-hook "$dir" || true
+    fi
     head=$(git -C "$dir" rev-parse HEAD)
     write_state "$r" base "$head"
     write_state "$r" head "$head"
@@ -220,6 +223,13 @@ check() {
     git merge-base --is-ancestor "$base" HEAD \
       || fail "$r : historique réécrit depuis le SHA de départ, push refusé"
     # Travail non commité : conservé dans un commit explicite pour la reprise.
+    # D'abord réintroduire les enregistrements signés du carry déjà présents sur la branche.
+    for _msc in "${T:-/opt/fullrun-tools}/merge-signed-carry.sh" "$here/merge-signed-carry.sh"; do
+      if [ -x "$_msc" ]; then
+        "$_msc" "$dir" || true
+        break
+      fi
+    done
     if [ -n "$("${G[@]}" status --porcelain)" ]; then
       "${G[@]}" add -A
       "${G[@]}" commit -q -m "wip(ci): état non commité à la fin du run (dépôt supplémentaire $r)" || true

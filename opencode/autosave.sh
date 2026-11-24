@@ -65,6 +65,16 @@ W=$(mktemp -d "$AS_TMP/autosave.XXXXXX") || exit 0
 chmod 0700 "$W"
 trap 'rm -rf "$W"' EXIT
 
+# Avant de commiter le carry : réintroduire les enregistrements signés déjà
+# présents sur la branche (export après retreat, persist amputé).
+# Copie figée $T en CI ; à côté du script en test local.
+for _msc in "${T:-/opt/fullrun-tools}/merge-signed-carry.sh" "$HERE/merge-signed-carry.sh"; do
+  if [ -x "$_msc" ]; then
+    "$_msc" "$AS_REPO" || true
+    break
+  fi
+done
+
 as_git status --porcelain=v1 -z -uall > "$W/status.z" 2>/dev/null || { echo "autosave : git status impossible, rien commité"; exit 0; }
 [ -s "$W/status.z" ] || exit 0
 

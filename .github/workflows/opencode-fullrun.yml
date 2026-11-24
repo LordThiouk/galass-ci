@@ -648,6 +648,9 @@ jobs:
           # Aucun remote utilisable par l'IA : le push final ajoute ses propres identifiants.
           printf '#!/bin/sh\necho "push interdit pendant le run opencode" >&2\nexit 1\n' > .git/hooks/pre-push
           chmod +x .git/hooks/pre-push
+          if [ -x "$CI_DIR/opencode/merge-signed-carry.sh" ]; then
+            "$CI_DIR/opencode/merge-signed-carry.sh" install-hook "$TARGET_DIR" || true
+          fi
           mkdir -p "$OC_WORK"
           # SHA de départ en sortie de step : opencode peut écrire dans $GITHUB_ENV, pas ici.
           echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -778,7 +781,7 @@ jobs:
             "$CI_DIR/opencode/extra-repos.sh" "$CI_DIR/opencode/emu-e2e.sh" "$T/"
           # Sourcé par extra-repos.sh, wippush.sh et livelog.sh depuis $T (pas le cwd).
           sudo install -o root -g root -m 0644 "$CI_DIR/opencode/allowed-repos.sh" "$CI_DIR/opencode/log-recipient.txt" "$CI_DIR/opencode/autosave-deny.txt" "$T/"
-          sudo install -o root -g root -m 0755 "$CI_DIR/opencode/autosave.sh" "$T/"
+          sudo install -o root -g root -m 0755 "$CI_DIR/opencode/autosave.sh" "$CI_DIR/opencode/merge-signed-carry.sh" "$T/"
           # CLI de verdict lifeos (source unique du verdict lu par done_check.sh) : bundle autonome construit ici,
           # copié en root avec un bun root — l'agent ne peut remplacer ni l'un ni l'autre pour fabriquer un PASS.
           # done_check.sh n'accepte QUE ce couple. Bundle impossible à construire = échec en dur (pas d'avertissement).
@@ -1176,7 +1179,7 @@ jobs:
           cd "$TARGET_DIR"
           # Outils figés avant opencode (root) : gitleaks, masquage, chiffrement, destinataire age.
           T=/opt/fullrun-tools; L=/opt/fullrun-live
-          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh checkpoint.sh autosave.sh autosave-deny.txt extra-repos.sh emu-e2e.sh allowed-repos.sh log-recipient.txt; do
+          for tool in gitleaks redact-log.sh leaklog.sh progress.sh wippush.sh done_check.sh checkpoint.sh autosave.sh autosave-deny.txt extra-repos.sh emu-e2e.sh allowed-repos.sh log-recipient.txt merge-signed-carry.sh; do
             [ -f "$T/$tool" ] || { echo "::error::outil figé absent ($tool) : push refusé"; exit 1; }
           done
           # Artefact chiffré (journal + rapport gitleaks) : publié seulement si un contrôle refuse.
@@ -1276,6 +1279,11 @@ jobs:
             fail_check workflows "modification de .github/workflows : push refusé"
           fi
           # Travail non commité : conservé dans un commit explicite pour la reprise.
+          # Réintroduire d'abord les enregistrements signés du carry déjà présents sur la branche
+          # (un export après retreat peut avoir tronqué le fichier dans l'arbre).
+          if [ -x "$T/merge-signed-carry.sh" ]; then
+            "$T/merge-signed-carry.sh" "$TARGET_DIR" || true
+          fi
           if [ -n "$("${G[@]}" status --porcelain)" ]; then
             "${G[@]}" add -A
             "${G[@]}" commit -q -m "wip(ci): état non commité à la fin du run $IN_JOB" || true
