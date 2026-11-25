@@ -1,41 +1,46 @@
 # GALASS — état avant fix FullRun (2026-11-25)
 
-Accès : `gh` refusé par le sandbox ; Rider/Driver/backend = clones shallow `main` seul (API 404, fetch auth KO). Seuls galass-ci et galass-emu-actions-pub ont pu être fetchés. Les tips multi-branches privés viennent de l'état/ISA du 2026-11-23, non re-vérifiés ce run.
+Accès: `gh` refusé par le sandbox; `git fetch` privé Rider/Driver/backend KO (auth). Refs déjà complètes localement; tips lus dessus. Aucun code modifié; aucun test exécuté (Flutter absent).
 
-## Branches (branche multistop + head)
-- Galass_Rider : `feat/multistop-rider-close-2026-11-20` @47a2ee2 (tip cité ISA, non fetché ; 3a3731e cité plus récent) ; main @7984da7.
-- Galass_Driver : `feat/multistop-e2e-2026-11-15` @c9c65ff (tip cité ISA, non fetché) ; main @9b34386 ; e2e workflow défaut `fix/multistop-close` (à réconcilier).
-- Galass_backend : `fix/multistop-notifs` @3820b623 (tip cité ISA, non fetché) ; main @2aa0dcd1 (ISA 95/125, 39 ouverts).
-- galass-emu-actions-pub : `feat/multistop-e2e-2026-11-15` @0cc7a5c (plus récent ; diff main = ISA + `e2e/run.sh`, 2 fichiers +122/-45, pas de merge-base) ; `feat/multistop-rider-close-2026-11-20` @b4b0c91 (goldens ; diff main 26 fichiers +3059/-105) ; main @33f9ab9.
-- galass-ci : `feat/multistop-e2e-2026-11-15` @10f1133 (15 commits emu/fullrun ; diff main +461/-117 sur `opencode/emu-e2e.sh`, `opencode/tests/with-emulators-test.sh`, `opencode-fullrun.yml`) ; état `state/galass-2026-11-25` @5db110f ; main @a34cab2.
+## Branches multistop (branche @ head)
+- Galass_Rider: `feat/multistop-e2e-2026-11-15` @ `bceb7a0` — 11 ISC ouverts.
+- Galass_Driver: `feat/multistop-e2e-2026-11-15` @ `9208af6` — phase `complete` incohérente, 14/20, 7 ouverts.
+- Galass_backend: `feat/multistop-e2e-2026-11-15` @ `8523cf32` — 124/156, 29 cases `[ ]` (dont splits/dropped) + 5 bridges ouverts.
+- galass-emu-actions-pub: `feat/multistop-e2e-2026-11-15` @ `0cc7a5c` — ISA 1/4; goldens/porte sur `feat/multistop-rider-close-2026-11-20` @ `b4b0c91`.
+- galass-ci: `feat/multistop-e2e-2026-11-15` @ `10f1133` — pas d'ISA multistop; 8 commits devant main, 10 derrière.
 
-## (a) Correctifs UI (file:line, lus sur main ; branche close non fetchée)
-- Rider ACTIVE : pas de SOS/notes/profil — `lib/presentation/screens/ride/widget/ride_details_bottom_sheet_widget.dart:172-269` ; SOS seulement RUNNING `:272-306` (contrats F4-26/27 FAIL).
-- Rider notes : texte figé `lib/core/utils/my_strings.dart:155`, rendu `ride_details_bottom_sheet_widget.dart:606` au lieu de `ride.note` (régression F4-25).
-- Rider timeline : RUNNING ne garde qu'une jambe `lib/presentation/screens/ride/widget/ride_itinerary_timeline.dart:248-294` ; sans `stops` dans RIDE_END, seul Destination (R8-2 ; backend ISC-65 clos mais preuve device absente).
-- Rider compteur x/N : `ride_details_bottom_sheet_widget.dart:684` ; retirer le texte, poser Semantics/Key stable (ISC-F4-22).
-- Rider carte ACTIVE : `lib/data/controller/ride/ride_details/ride_details_controller.dart:404-418` ne numérote que PENDING ; preuve device pins sans numéro + polyline (ISC-F4-10).
-- Driver placeholders : `.rKv` remplace `{clé}` mais chaînes en `@clé` — `lib/presentation/components/dialog/custom_new_ride_dialog.dart:442-446`, `lib/presentation/screens/rides/home_screen/widget/new_ride_card.dart:238-242`, `lib/core/utils/my_strings.dart:82` → `@priceKey/@distanceKey` bruts (D-11).
-- Driver build : `lib/core/route/route.dart:7` importe `screens/Profile/` alors que le dossier est `profile/` → échec Linux/CI (CFG-1).
-- Driver compteur : `lib/presentation/components/timeline/ride_itinerary_timeline.dart:76-90` + `my_strings.dart:77-80` ; retrait x/N + Semantics (ISC-F5-14).
+## Activité récente / diff vs main
+- Rider: 15 commits = rapports r5/r6, autosave/checkpoints, fixes H1/H2 `ee14366`, M3 `b4a5c72`, revert F4-21. Diff 54 fichiers +4610/−170. Fait: F4-22/25/26/27 + garde badge; reste F4-21 et preuves.
+- Driver: 15 = baseline goldens, checkpoints, F5-14 `fc2b822`, M3 `9208af6`. Diff 88 fichiers +11989/−321. Fait: F5-14, goldens, D-11/CFG-1; reste F5-12/16/17/18.
+- Backend: 15 = ISA F19 `8523cf32`, e2e cash-flow, checkpoints. Diff 73 fichiers +4964/−23. Fait: payloads END/cash avec stops (ISC-64..67); reste preuves staging/device et bridges UI.
+- Emu: 15 = composition/cash e2e, ISA harnais, nav content-desc `0eae2d1`. Diff e2e = 1 fichier +119 (ISA); close = 26 fichiers +3059/−105 (goldens/gate). Porte locale faite; EMU-1/2/3 non livrés.
+- CI: 15 = start_step/autosave/verdicts, emu `--ref`/`head_branch`/KILL groupe `10f1133`. Diff 3 fichiers +461/−117. Fait: legs robustes; pas de run courant, branche désynchronisée.
 
-## (b) ISCs multistop restants + preuve
-- Rider ISA `MEMORY/WORK/20261006-galass-rider-multistop/ISA.md` : 23/26, `climbing`. Ouverts : Bridge-B3 (ordre stops), Device ACTIVE F4-10, Bridge-B6 ; F4-22/F4-25..29 sur branche close. Preuve : e2e staging create 2 stops → GET detail, captures device, contrats widget, golden-diff.
-- Backend ISA `MEMORY/WORK/20261006-galass-regression-multistop/ISA.md` : 95/125, 39 ouverts. Bloquants : Bridge-F4-1/F4-3, ISC-F4-6, Bridge-F5-2, ISC-F5-5, ISC-39/39.1/39.2, ISC-24.1/24.2, ISC-21/22/22.1/22.4/23, ISC-45/45.1, ISC-56.1, ISC-61.1..61.7. Preuve : logs Pusher staging, smoke staging, device dumpsys, e2e.
-- Driver ISA 18/18 complete ; F6 (ISC-F5-14/17) reste à livrer/prouver.
-- galass-ci : pas d'ISA multistop ; leg emu-e2e fonctionnel (dispatch `--ref`, garde `head_branch`, kill du groupe de processus), reste à prouver par un run courant.
+## (a) Correctifs UI (fichier:ligne, branche multistop)
+- Rider F4-21 OUVERT: numérotation PENDING seulement (`lib/data/controller/map/ride_map_controller.dart:211`), repli `destinationIcon` (`:409-430`), câblage sans complétion/index actif (`lib/data/controller/ride/ride_details/ride_details_controller.dart:438-453`).
+- Rider F4-28/F4-31: SOS rendu seulement RUNNING (`lib/presentation/screens/ride/widget/ride_details_bottom_sheet_widget.dart:349-361`); pas de golden ACTIVE; CTA « prise en charge » absent → Papa.
+- Rider fait mais non prouvé: F4-22 `…bottom_sheet_widget.dart:127-135`; F4-25/26 `:51-54` + `:647-750`; F4-27 `ride_itinerary_timeline.dart:311-330`; F4-29 `test/widget/course_en_cours_contract_test.dart:88`.
+- Rider tests à retourner (rouges attendus): `test/unit/multistop_itinerary_test.dart:139-185`; `test/unit/multistop_running_sheet_test.dart:145-157,159-168,171-183,197-234`.
+- Driver F5-12 OUVERT: deux CTA simultanés, END seulement `isDisabled` (`lib/presentation/screens/ride_details/widgets/ride_details_bottom_sheet_widget.dart:219-260`); F5-16 icône uniforme (`lib/data/controller/map/ride_map_controller.dart:245-257`); F5-18 timeline sans `completedAt` (`lib/presentation/components/timeline/ride_itinerary_timeline.dart:342-359`); F5-17 contrat absent.
+- Driver fait: F5-14 Semantics (`…ride_details_bottom_sheet_widget.dart:72-80`); F5-13 danger `:199-207`; D-11 `rKv` @clé (`lib/core/helper/string_format_helper.dart:212-218`) et CFG-1 `route.dart:7` OK.
+- Backend: `RIDE_END` charge `stops` avant l'event (`core/app/Http/Controllers/Api/Driver/RideController.php:152,192-194`); details/cash portent stops (ISC-64..67).
 
-## (c) Goldens / preuve pixel
-- Vit dans `galass-emu-actions-pub`, branche `feat/multistop-rider-close-2026-11-20` @b4b0c91 : `goldens/gate.sh`, `goldens/board.py`, `.github/workflows/golden-diff.yml`, ISA `MEMORY/WORK/20261123-galass-emu-golden-anti-regression/ISA.md` (1/4).
-- `gate.sh` restaure PNG + `*.dart` depuis la base, lance `flutter test test/goldens/<app>` (pixels stricts, sans seuil), exit 0/1/2 ; workflow `workflow_dispatch` + `repository_dispatch` `golden-diff`, lecture seule, accept seulement avec `reason`.
-- Mesuré 2026-11-23 : base 7984da7+goldens (08cc8cd) VERT 10/10 ; Rider 47a2ee2 ROUGE 5/10 (max 27,33 %) ; F4-25 PASS main/FAIL branche, F4-26/27 FAIL/FAIL (préexistant), F4-28 PASS/PASS.
-- Manque : goldens non fusionnés sur main Rider (`--base origin/main` exit 2), `test/goldens/driver/` absent, workflow jamais dispatché, ISC-EMU-1 bloqué (contrat de clé), ISC-EMU-2/3 non livrés. B3 existe (`e2e/b3_order.py`, `compose_order.py`) mais aucun run courant.
+## (b) ISC multistop restants + preuve nécessaire
+- Rider (11): F4-21..31. Preuves: contrats/widget verts après flips; helpers + capture e2e carte active/estompée (aucun golden ne contient `GoogleMap`, donc F4-10/F4-21 = unit+e2e); goldens ACTIVE et sha distincts; e2e Bridge-B3 create 2 stops → GET détail même ordre; décisions Papa F4-28/F4-30.
+- Driver (7): F5-12..18. Preuves: `test/widget/course_en_cours_driver_contract_test.dart` à créer; unit `primaryRideActionFor`/`stopMarkers`; golden stop1/stop2 distincts; captures e2e; accept Papa.
+- Backend: bloquants multistop = Bridge-F4-1, Bridge-F4-3 (tarif), Bridge-F5-2 (segment courant), ISC-F4-6; ISC-39/39.1/39.2 (logs Pusher staging); ISC-24.1/24.2 (smoke staging); Bridge-F17-3/ISC-F17-4 (resync rider); ISC-F18-2/18-1b/Anti-F18-1 (start driver); ISC-61.1..7 (push device); ISC-21/22/23/45 (deploy SHA).
+- Emu: ISC-EMU-1 bloqué — marqueurs lisent encore le texte compteur (`e2e/run.sh:117-118,145-146`), aucun chemin `content-desc` réservé dans `e2e/ui.sh`; ISC-EMU-2/3 non livrés; ISC-EMU-4 coché sur preuve locale seulement.
+
+## (c) Goldens / preuve pixel L2
+- Rider: 10 PNG sur la branche Rider (base `main` 7984da7); `course_en_cours_simple.png` == `course_en_cours_tous_arrets_faits.png` (sha `4794e22d…`), donc F4-30 faux; stop1 actif/fait distincts.
+- Driver: 7 PNG sur la branche Driver; `driver_ride_running_multistop_stop_1_active.png` == `..._stop_2_active.png` (sha `9a571b18…`), donc F5-18 faux.
+- Porte: `goldens/gate.sh` restaure PNG + `*.dart` depuis la base, `flutter test` pixels stricts, exit 0/1/2; `goldens/board.py` planche; `.github/workflows/golden-diff.yml` (`workflow_dispatch` + `repository_dispatch`, Flutter 3.44.8, lecture seule, accept = `reason` obligatoire).
+- Manque: workflow jamais dispatché; goldens Rider absents de `main` (`--base origin/main` → exit 2); `test/goldens/driver/` absent de `main`; porte Driver non branchée par défaut; ISC-EMU-1 non câblé. Bridge-B3 reste une preuve backend staging, pas un golden.
 
 ## (d) Tâches ordonnées pour un fix FullRun
-1. Débloquer git authentifié (fetch/unshallow Rider, Driver, backend via secret CI, jamais en dur) et refaire l'état multi-branches réel.
-2. Backend (`fix/multistop-notifs`) : STOP_COMPLETED + logs ISC-39/39.1/39.2 ; `stops` dans RIDE_END/cash ISC-64..66 ; ISC-24.2 staging ; Bridge-F4-3 tarif.
-3. Rider (`feat/multistop-rider-close-2026-11-20`) : SOS/notes/profil ACTIVE ; retrait x/N + Semantics F4-22 ; contrats F4-25..29 ; carte ACTIVE F4-10 ; timeline R8-2.
-4. Driver (`feat/multistop-e2e-2026-11-15`) : retrait x/N + Semantics F5-14 ; résumé stops offre ; placeholders D-11 ; CFG-1 ; contrat F5-17.
-5. Goldens (`feat/multistop-rider-close-2026-11-20` emu) : fusionner `test/goldens/rider`, créer `test/goldens/driver`, dispatcher `golden-diff`, accepter la base explicitement.
-6. E2E (`feat/multistop-e2e-2026-11-15` emu + galass-ci) : marqueurs sur repère stable (ISC-EMU-1), porte B3 + verdict global ISC-EMU-3.
-7. Preuves et clôture : Bridge-B3/B6, device F4-10, dual-write SHA, flutter test/phpunit, puis FullRun.
+1. Backend — `feat/multistop-e2e-2026-11-15`: smoke staging 24.1/24.2; logs `STOP_COMPLETED` 39/39.1/39.2; Bridge-F4-3 tarif; Bridge-F5-2; puis F17/F18.
+2. Rider — `feat/multistop-e2e-2026-11-15`: flips tests; F4-21 sans changer `loadMap` (porteur `RideStopProgress`); contrat F4-29 + F4-22/25/26/27; F4-31 capture; décisions F4-28/F4-30; preuve F4-10 + B3.
+3. Driver — `feat/multistop-e2e-2026-11-15`: F5-12 CTA unique; F5-16 `stopMarkers`; F5-18 `completedAt`; créer F5-17; régénérer goldens via la porte.
+4. Emu — `feat/multistop-rider-close-2026-11-20` (porte) et `feat/multistop-e2e-2026-11-15` (harnais): fusionner les goldens sur la référence; créer `test/goldens/driver` sur main; dispatcher `golden-diff`; implémenter EMU-1 `content-desc` + marqueurs; EMU-2/3.
+5. CI — `feat/multistop-e2e-2026-11-15`: réconcilier avec `main` (10 commits) sans merge, rejouer `opencode/tests/with-emulators-test.sh`, puis un e2e courant avec `--ref`.
+6. Clôture — preuves Rider/Driver/backend + golden gate + e2e P0 au même run; vérifier `flutter test`/PHPUnit; alors seulement FullRun.
