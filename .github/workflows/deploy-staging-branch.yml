@@ -1,0 +1,181 @@
+name: Deploy Staging (branch, manual)
+
+# CI produit (galass-ci, public) — deploy STAGING-ONLY d'un SHA/branche Galass_backend
+# sans passer par le dépôt privé (billing ubuntu-latest). JAMAIS main → prod.
+# Pas de job prod, pas de /var/www/galass, pas de promote-prod.
+run-name: staging-branch ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch name or commit SHA of Galass_backend to deploy to STAGING
+        required: true
+        type: string
+      promote_markers:
+        description: After smoke GREEN, run promote-good-sha (ISC-45/45.1)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy-staging-branch:
+    if: github.actor == 'LordThiouk' && github.triggering_actor == 'LordThiouk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Checkout Galass_backend @ tip
+        uses: actions/checkout@v4
+        with:
+          repository: LordThiouk/Galass_backend
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GALASS_TOKEN }}
+          path: backend
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve ref to a full SHA
+        id: resolve
+        working-directory: backend
+        run: |
+          sha="$(git rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "bad sha" >&2; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "staging branch deploy: ref=$INPUT_REF sha=$sha"
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+
+      - name: Require host key fingerprint
+        env:
+          FP: ${{ secrets.VPS_HOST_FINGERPRINT }}
+        run: |
+          if [[ "$FP" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]; then exit 0; fi
+          echo "VPS_HOST_FINGERPRINT missing or not in the SHA256:<43 base64 chars> form" >&2
+          exit 1
+
+      - name: Run on VPS over SSH (staging only)
+        uses: docker://ghcr.io/appleboy/drone-ssh@sha256:179cbd253771007f2ebcaf7a3860afe059207351de1f3378efafac93bd310158
+        env:
+          GITHUB: "true"
+          DEPLOY_SHA: ${{ steps.resolve.outputs.sha }}
+          ALLOW_BRANCH_STAGING: "1"
+          INPUT_HOST: ${{ secrets.VPS_HOST }}
+          INPUT_USERNAME: ${{ secrets.VPS_USER }}
+          INPUT_KEY: ${{ secrets.VPS_SSH_KEY }}
+          INPUT_FINGERPRINT: ${{ secrets.VPS_HOST_FINGERPRINT }}
+          INPUT_PORT: "22"
+          INPUT_TIMEOUT: 30s
+          INPUT_COMMAND_TIMEOUT: 10m
+          INPUT_ENVS: DEPLOY_SHA,ALLOW_BRANCH_STAGING
+          INPUT_SCRIPT: |
+            set -euo pipefail
+            SITE=/var/www/galass-staging
+            FLOOR_SHA=bf1bbd05cce61da3523f7bb95eb4c0f8085854ae
+            die() { echo "deploy: $*" >&2; exit 1; }
+            [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || die "invalid DEPLOY_SHA"
+            [[ "$SITE" == /var/www/galass-staging ]] || die "refusing: not the staging tree"
+            ENVF="$SITE/core/.env"
+            if [[ -e "$ENVF" || -L "$ENVF" ]]; then
+              [[ ! -L "$ENVF" ]] || die "refusing: core/.env is a symlink"
+              m="$(stat -c %a "$ENVF")"
+              if [[ "$(stat -c %U "$ENVF")" == www-data ]] || { [[ "$(stat -c %G "$ENVF")" == www-data ]] && (( 8#$m & 8#020 )); } || (( 8#$m & 8#002 )); then
+                die "refusing: core/.env is writable by www-data"
+              fi
+            fi
+            bad="$(find "$SITE" \( -path "$SITE/core/storage" -o -path "$SITE/assets" \) -prune -o \( ! -user "$(id -u)" -o -perm /022 \) -print -quit 2>&1)" || die "refusing: tree check failed: $bad"
+            [[ -z "$bad" ]] || die "refusing: wrong owner or group/world-writable (or symlink): $bad"
+            G=(git -c core.fsmonitor= -c core.hooksPath=/dev/null -c core.sshCommand=ssh -c protocol.ext.allow=never -C "$SITE")
+            "${G[@]}" fetch -q --upload-pack=git-upload-pack origin -- "$DEPLOY_SHA" "+refs/heads/main:refs/remotes/origin/main"
+            if [[ "${ALLOW_BRANCH_STAGING:-0}" == 1 && "$SITE" == /var/www/galass-staging ]]; then
+              echo "deploy: ALLOW_BRANCH_STAGING=1 on staging tree, branch sha allowed"
+            else
+              "${G[@]}" merge-base --is-ancestor "$DEPLOY_SHA" refs/remotes/origin/main || die "sha is not on main"
+            fi
+            "${G[@]}" merge-base --is-ancestor "$FLOOR_SHA" "$DEPLOY_SHA" || die "sha is below the floor $FLOOR_SHA"
+            OPS_TMP="$(mktemp -d)"
+            trap 'rm -rf "$OPS_TMP"' EXIT
+            "${G[@]}" show "$DEPLOY_SHA:scripts/ops/deploy-site.sh" > "$OPS_TMP/deploy-site.sh"
+            bash "$OPS_TMP/deploy-site.sh" "$SITE" "$DEPLOY_SHA" staging skip-cron
+
+  smoke:
+    needs: deploy-staging-branch
+    if: github.actor == 'LordThiouk' && github.triggering_actor == 'LordThiouk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Galass_backend @ deployed SHA
+        uses: actions/checkout@v4
+        with:
+          repository: LordThiouk/Galass_backend
+          ref: ${{ needs.deploy-staging-branch.outputs.sha }}
+          token: ${{ secrets.GALASS_TOKEN }}
+          path: backend
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Smoke staging (ISC-24.1 / 24.2)
+        working-directory: backend
+        run: bash scripts/ops/smoke-staging.sh
+        env:
+          GALASS_STAGING_URL: ${{ secrets.GALASS_STAGING_URL }}
+          GALASS_DEV_TOKEN: ${{ secrets.GALASS_DEV_TOKEN }}
+          GALASS_SMOKE_USER_TOKEN: ${{ secrets.GALASS_SMOKE_USER_TOKEN }}
+
+  promote-staging-marker:
+    needs: [deploy-staging-branch, smoke]
+    if: >-
+      github.actor == 'LordThiouk' && github.triggering_actor == 'LordThiouk'
+      && inputs.promote_markers == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require host key fingerprint
+        env:
+          FP: ${{ secrets.VPS_HOST_FINGERPRINT }}
+        run: |
+          if [[ "$FP" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]; then exit 0; fi
+          echo "VPS_HOST_FINGERPRINT missing or not in the SHA256:<43 base64 chars> form" >&2
+          exit 1
+
+      - name: Promote last-good after smoke GREEN (ISC-45 / 45.1)
+        uses: docker://ghcr.io/appleboy/drone-ssh@sha256:179cbd253771007f2ebcaf7a3860afe059207351de1f3378efafac93bd310158
+        env:
+          GITHUB: "true"
+          DEPLOY_SHA: ${{ needs.deploy-staging-branch.outputs.sha }}
+          INPUT_HOST: ${{ secrets.VPS_HOST }}
+          INPUT_USERNAME: ${{ secrets.VPS_USER }}
+          INPUT_KEY: ${{ secrets.VPS_SSH_KEY }}
+          INPUT_FINGERPRINT: ${{ secrets.VPS_HOST_FINGERPRINT }}
+          INPUT_PORT: "22"
+          INPUT_TIMEOUT: 30s
+          INPUT_COMMAND_TIMEOUT: 10m
+          INPUT_ENVS: DEPLOY_SHA
+          INPUT_SCRIPT: |
+            set -euo pipefail
+            SITE=/var/www/galass-staging
+            FLOOR_SHA=bf1bbd05cce61da3523f7bb95eb4c0f8085854ae
+            die() { echo "promote: $*" >&2; exit 1; }
+            [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || die "invalid DEPLOY_SHA"
+            [[ "$SITE" == /var/www/galass-staging ]] || die "refusing: not the staging tree"
+            G=(git -c core.fsmonitor= -c core.hooksPath=/dev/null -c core.sshCommand=ssh -c protocol.ext.allow=never -C "$SITE")
+            "${G[@]}" fetch -q --upload-pack=git-upload-pack origin -- "$DEPLOY_SHA" "+refs/heads/main:refs/remotes/origin/main"
+            "${G[@]}" merge-base --is-ancestor "$FLOOR_SHA" "$DEPLOY_SHA" || die "sha is below the floor $FLOOR_SHA"
+            OPS_TMP="$(mktemp -d)"
+            trap 'rm -rf "$OPS_TMP"' EXIT
+            "${G[@]}" show "$DEPLOY_SHA:scripts/ops/promote-good-sha.sh" > "$OPS_TMP/promote-good-sha.sh"
+            bash "$OPS_TMP/promote-good-sha.sh" "$SITE" "$DEPLOY_SHA" staging
+            echo "markers:"
+            for f in current-sha last-good-sha previous-good-sha; do
+              p="$SITE/.deploy/staging/$f"
+              echo -n "$f="
+              [[ -f "$p" ]] && cat "$p" || echo "(missing)"
+            done
