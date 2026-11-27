@@ -1,0 +1,61 @@
+name: PHPUnit Tests
+
+# CI produit (galass-ci, public) — PHPUnit de Galass_backend sur ubuntu-latest
+# sans passer par le dépôt privé (billing / runner self-hosted galass-box offline).
+run-name: phpunit ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch name or commit SHA of Galass_backend to test
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch name or commit SHA of Galass_backend to test
+        required: true
+        type: string
+    secrets:
+      GALASS_TOKEN:
+        description: PAT read-only sur Galass_backend (requis si l'appelant n'a pas accès privé)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend/core
+    steps:
+      - name: Checkout Galass_backend @ ref
+        uses: actions/checkout@v4
+        with:
+          repository: LordThiouk/Galass_backend
+          ref: ${{ inputs.ref }}
+          # Dispatch depuis galass-ci (public) → GALASS_TOKEN.
+          # Appel depuis Galass_backend → github.token de l'appelant suffit.
+          token: ${{ secrets.GALASS_TOKEN || github.token }}
+          path: backend
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          extensions: mbstring, pdo_sqlite, bcmath
+
+      - name: Bootstrap Laravel
+        run: bash ../scripts/ci/bootstrap-laravel.sh .
+
+      - name: Composer install
+        run: composer install --no-interaction --prefer-dist
+
+      - name: PHPUnit (artisan test)
+        run: php artisan test
